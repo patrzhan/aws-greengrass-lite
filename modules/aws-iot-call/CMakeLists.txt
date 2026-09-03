@@ -2,7 +2,4 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-ggl_init_module(
-  aws-iot-call
-  NO_INLINE_TEST
-  LIBS gg-sdk core-bus core-bus-aws-iot-mqtt)
+ggl_init_module(aws-iot-call LIBS gg-sdk core-bus core-bus-aws-iot-mqtt)

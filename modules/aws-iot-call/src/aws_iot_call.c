@@ -116,20 +116,30 @@ static GgError subscription_callback(
         return GG_ERR_OK;
     }
 
+    GgError response_ret;
     if (gg_buffer_has_suffix(topic, GG_STR("/accepted"))) {
         if (!decoded) {
             return GG_ERR_INVALID;
         }
-        call_ctx->ret = GG_ERR_OK;
+        response_ret = GG_ERR_OK;
     } else if (gg_buffer_has_suffix(topic, GG_STR("/rejected"))) {
         GG_LOGE(
             "Received rejected response: %.*s", (int) payload.len, payload.data
         );
-        call_ctx->ret = GG_ERR_REMOTE;
+        response_ret = GG_ERR_REMOTE;
     } else {
         return GG_ERR_INVALID;
     }
 
+    ret = gg_arena_claim_obj(call_ctx->result, call_ctx->alloc);
+    if (ret != GG_ERR_OK) {
+        GG_LOGE("Insufficient memory to own response payload.");
+        *(call_ctx->result) = GG_OBJ_NULL;
+        call_ctx->ret = ret;
+        return GG_ERR_EXPECTED;
+    }
+
+    call_ctx->ret = response_ret;
     // Err to close subscription
     return GG_ERR_EXPECTED;
 }
@@ -252,3 +262,105 @@ GgError ggl_aws_iot_call(
 
     return ctx.ret;
 }
+
+#ifdef GG_SDK_TESTING
+
+#include <gg/test.h>
+#include <string.h>
+#include <unity.h>
+
+static void assert_response_payload_is_owned(
+    GgBuffer topic, GgError expected_result
+) {
+    uint8_t payload_mem[] = "{\"clientToken\":\"token\",\"key\":\"value\"}";
+    GgBuffer payload = {
+        .data = payload_mem,
+        .len = sizeof(payload_mem) - 1,
+    };
+    uint8_t result_mem[512];
+    GgArena alloc = gg_arena_init(GG_BUF(result_mem));
+    GgObject result = GG_OBJ_NULL;
+    GgBuffer client_token = GG_STR("token");
+    CallbackCtx ctx = {
+        .client_token = &client_token,
+        .alloc = &alloc,
+        .result = &result,
+        .ret = GG_ERR_FAILURE,
+    };
+    GgObject data = gg_obj_map(GG_MAP(
+        gg_kv(GG_STR("topic"), gg_obj_buf(topic)),
+        gg_kv(GG_STR("payload"), gg_obj_buf(payload))
+    ));
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_EXPECTED, subscription_callback(&ctx, 1, data)
+    );
+    TEST_ASSERT_EQUAL_INT(expected_result, ctx.ret);
+
+    memset(payload_mem, 'x', sizeof(payload_mem));
+
+    TEST_ASSERT_EQUAL_INT(GG_TYPE_MAP, gg_obj_type(result));
+    GgMap result_map = gg_obj_into_map(result);
+    GgObject *value = NULL;
+    TEST_ASSERT_TRUE(gg_map_get(result_map, GG_STR("clientToken"), &value));
+    TEST_ASSERT_TRUE(gg_buffer_eq(gg_obj_into_buf(*value), GG_STR("token")));
+    TEST_ASSERT_TRUE(gg_map_get(result_map, GG_STR("key"), &value));
+    TEST_ASSERT_TRUE(gg_buffer_eq(gg_obj_into_buf(*value), GG_STR("value")));
+
+    for (size_t i = 0; i < result_map.len; i++) {
+        TEST_ASSERT_TRUE(
+            gg_arena_owns(&alloc, gg_kv_key(result_map.pairs[i]).data)
+        );
+        GgObject *map_value = gg_kv_val(&result_map.pairs[i]);
+        if (gg_obj_type(*map_value) == GG_TYPE_BUF) {
+            TEST_ASSERT_TRUE(
+                gg_arena_owns(&alloc, gg_obj_into_buf(*map_value).data)
+            );
+        }
+    }
+}
+
+GG_TEST_DEFINE(aws_iot_call_accepted_response_is_caller_owned) {
+    assert_response_payload_is_owned(GG_STR("topic/accepted"), GG_ERR_OK);
+}
+
+GG_TEST_DEFINE(aws_iot_call_rejected_response_is_caller_owned) {
+    assert_response_payload_is_owned(GG_STR("topic/rejected"), GG_ERR_REMOTE);
+}
+
+GG_TEST_DEFINE(aws_iot_call_returns_nmem_when_response_cannot_be_owned) {
+    uint8_t payload_mem[320];
+    const GgBuffer prefix = GG_STR("{\"key\":\"");
+    memcpy(payload_mem, prefix.data, prefix.len);
+    memset(payload_mem + prefix.len, 'a', 300);
+    payload_mem[prefix.len + 300] = '"';
+    payload_mem[prefix.len + 301] = '}';
+    GgBuffer payload = {
+        .data = payload_mem,
+        .len = prefix.len + 302,
+    };
+
+    // Large enough to decode the map structure, but too small to claim the
+    // 300-byte value from the transient payload.
+    uint8_t result_mem[128];
+    GgArena alloc = gg_arena_init(GG_BUF(result_mem));
+    GgObject result = GG_OBJ_NULL;
+    CallbackCtx ctx = {
+        .client_token = NULL,
+        .alloc = &alloc,
+        .result = &result,
+        .ret = GG_ERR_FAILURE,
+    };
+    GgObject data = gg_obj_map(GG_MAP(
+        gg_kv(GG_STR("topic"), gg_obj_buf(GG_STR("topic/accepted"))),
+        gg_kv(GG_STR("payload"), gg_obj_buf(payload))
+    ));
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_EXPECTED, subscription_callback(&ctx, 1, data)
+    );
+    TEST_ASSERT_EQUAL_INT(GG_ERR_NOMEM, ctx.ret);
+    TEST_ASSERT_EQUAL_INT(GG_TYPE_NULL, gg_obj_type(result));
+}
+
+#endif
