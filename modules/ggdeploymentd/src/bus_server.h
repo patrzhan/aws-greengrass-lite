@@ -5,6 +5,8 @@
 #ifndef GGDEPLOYMENTD_BUS_SERVER_H
 #define GGDEPLOYMENTD_BUS_SERVER_H
 
-void ggdeploymentd_start_server(void);
+#include <gg/error.h>
+
+GgError ggdeploymentd_start_server(void);
 
 #endif
