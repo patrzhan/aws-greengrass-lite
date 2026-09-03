@@ -332,9 +332,37 @@ static bool temp_recipe_store_active;
 
 static void remove_temp_recipe_store(void);
 
-// Defined in stale_component.c under GG_SDK_TESTING. Keep these declarations
-// private to the inline-test binary rather than production headers.
+// Defined in their translation units under GG_SDK_TESTING. Keep these
+// declarations private to the inline-test binary rather than production
+// headers.
+void component_manager_reset_test_seams(void);
+void component_manager_override_test_seam_for_reset_test(void);
+bool component_manager_test_seams_are_reset(void);
+void deployment_handler_reset_test_seams(void);
+void deployment_handler_override_test_seam_for_reset_test(void);
+bool deployment_handler_test_seams_are_reset(void);
+bool deployment_handler_configarn_test_seam_is_reset(void);
+void iotcored_instance_reset_test_seams(void);
+void iotcored_instance_override_test_seam_for_reset_test(void);
+bool iotcored_instance_test_seams_are_reset(void);
+void iot_jobs_reset_test_seams(void);
+void iot_jobs_override_test_seam_for_reset_test(void);
+bool iot_jobs_test_seams_are_reset(void);
+void bootstrap_manager_reset_test_seams(void);
+void bootstrap_manager_override_test_seam_for_reset_test(void);
+bool bootstrap_manager_test_seams_are_reset(void);
 void stale_component_reset_test_seams(void);
+void stale_component_override_test_seam_for_reset_test(void);
+bool stale_component_test_seams_are_reset(void);
+void bus_server_reset_test_seams(void);
+void bus_server_override_test_seam_for_reset_test(void);
+bool bus_server_test_seams_are_reset(void);
+void entry_reset_test_seams(void);
+void entry_override_test_seam_for_reset_test(void);
+bool entry_test_seams_are_reset(void);
+void credential_endpoint_reset_test_seams(void);
+void credential_endpoint_override_test_seam_for_reset_test(void);
+bool credential_endpoint_test_seams_are_reset(void);
 
 typedef struct {
     GgBuffer root_path;
@@ -388,7 +416,15 @@ static void reset_component_store_test_state(void) {
 void tearDown(void) {
     remove_temp_recipe_store();
     reset_component_store_test_state();
+    component_manager_reset_test_seams();
+    deployment_handler_reset_test_seams();
+    iotcored_instance_reset_test_seams();
+    iot_jobs_reset_test_seams();
+    bootstrap_manager_reset_test_seams();
     stale_component_reset_test_seams();
+    bus_server_reset_test_seams();
+    entry_reset_test_seams();
+    credential_endpoint_reset_test_seams();
 }
 
 static GgError component_store_fake_config_reader(
@@ -401,6 +437,42 @@ static GgError component_store_fake_config_reader(
     }
     *result = component_store_config_value;
     return GG_ERR_OK;
+}
+
+GG_TEST_DEFINE(binary_teardown_restores_cross_translation_unit_test_seams) {
+    component_manager_override_test_seam_for_reset_test();
+    deployment_handler_override_test_seam_for_reset_test();
+    iotcored_instance_override_test_seam_for_reset_test();
+    iot_jobs_override_test_seam_for_reset_test();
+    bootstrap_manager_override_test_seam_for_reset_test();
+    stale_component_override_test_seam_for_reset_test();
+    bus_server_override_test_seam_for_reset_test();
+    entry_override_test_seam_for_reset_test();
+    credential_endpoint_override_test_seam_for_reset_test();
+
+    TEST_ASSERT_FALSE(component_manager_test_seams_are_reset());
+    TEST_ASSERT_FALSE(deployment_handler_test_seams_are_reset());
+    TEST_ASSERT_FALSE(deployment_handler_configarn_test_seam_is_reset());
+    TEST_ASSERT_FALSE(iotcored_instance_test_seams_are_reset());
+    TEST_ASSERT_FALSE(iot_jobs_test_seams_are_reset());
+    TEST_ASSERT_FALSE(bootstrap_manager_test_seams_are_reset());
+    TEST_ASSERT_FALSE(stale_component_test_seams_are_reset());
+    TEST_ASSERT_FALSE(bus_server_test_seams_are_reset());
+    TEST_ASSERT_FALSE(entry_test_seams_are_reset());
+    TEST_ASSERT_FALSE(credential_endpoint_test_seams_are_reset());
+
+    tearDown();
+
+    TEST_ASSERT_TRUE(component_manager_test_seams_are_reset());
+    TEST_ASSERT_TRUE(deployment_handler_test_seams_are_reset());
+    TEST_ASSERT_TRUE(deployment_handler_configarn_test_seam_is_reset());
+    TEST_ASSERT_TRUE(iotcored_instance_test_seams_are_reset());
+    TEST_ASSERT_TRUE(iot_jobs_test_seams_are_reset());
+    TEST_ASSERT_TRUE(bootstrap_manager_test_seams_are_reset());
+    TEST_ASSERT_TRUE(stale_component_test_seams_are_reset());
+    TEST_ASSERT_TRUE(bus_server_test_seams_are_reset());
+    TEST_ASSERT_TRUE(entry_test_seams_are_reset());
+    TEST_ASSERT_TRUE(credential_endpoint_test_seams_are_reset());
 }
 
 GG_TEST_DEFINE(root_path_failed_reread_preserves_cached_bytes) {

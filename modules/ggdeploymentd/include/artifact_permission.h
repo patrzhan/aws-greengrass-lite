@@ -5,9 +5,10 @@
 #ifndef GGDEPLOYMENTD_ARTIFACT_PERMISSION_H
 #define GGDEPLOYMENTD_ARTIFACT_PERMISSION_H
 
+#include <gg/error.h>
 #include <gg/types.h>
 #include <sys/types.h>
 
-mode_t artifact_permission_to_mode(GgMap permission_map);
+GgError artifact_permission_to_mode(GgMap permission_map, mode_t *mode);
 
 #endif

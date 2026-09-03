@@ -20,7 +20,8 @@
 //! Pure storage: this module persists / reads / clears the slot. Flush
 //! orchestration (deciding when to re-send) lives in iot_jobs_listener.c.
 //!
-//! Thread-safe: all access is guarded by an internal mutex.
+//! Thread-safe: config-slot operations are serialized by an internal mutex,
+//! while the cached pending hint is accessed atomically.
 
 #include <gg/arena.h>
 #include <gg/error.h>
@@ -54,8 +55,8 @@ GgError status_keeper_clear(void);
 
 /// In-memory check for whether a slot is (believed to be) pending.
 ///
-/// Reads the cached hint (no config call of its own) to gate the periodic
-/// flush retry. The config slot remains authoritative.
+/// Atomically reads the cached hint without taking the config-slot mutex or
+/// issuing config I/O. The config slot remains authoritative.
 bool status_keeper_has_pending(void);
 
 #endif

@@ -14,8 +14,18 @@
 #include <ggl/core_bus/gg_config.h>
 #include <pthread.h>
 #include <sys/types.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
+
+// Serializes authoritative config-slot operations. These calls perform
+// synchronous ggconfigd I/O and may be reached from multiple threads.
+static pthread_mutex_t slot_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+// Cheap cache of "does a slot exist". Kept in sync by persist (set), read
+// (set on hit), and clear (unset). Authoritative state is the config slot;
+// this only lets the happy path avoid a config call.
+static atomic_bool slot_pending;
 
 // ggconfigd key path for the pending deployment-status slot.
 #define PENDING_STATUS_KEY_PATH \
@@ -24,17 +34,6 @@
         GG_STR("DeploymentService"), \
         GG_STR("pendingStatus") \
     )
-
-// Guards the config slot and the slot_pending hint. update_job_to can be
-// reached from both the deployment-handler thread and the job-listener thread,
-// so all operations are serialized here. ggconfigd serializes the underlying
-// config ops, but the in-memory hint still needs guarding.
-static pthread_mutex_t slot_mtx = PTHREAD_MUTEX_INITIALIZER;
-
-// Cheap cache of "does a slot exist". Kept in sync by persist (set), read
-// (set on hit), and clear (unset). Authoritative state is the config slot;
-// this only lets the happy path avoid a config call.
-static bool slot_pending = false;
 
 GgError status_keeper_persist(GgBuffer job_id, GgBuffer status) {
     GG_MTX_SCOPE_GUARD(&slot_mtx);
@@ -56,7 +55,7 @@ GgError status_keeper_persist(GgBuffer job_id, GgBuffer status) {
         return ret;
     }
 
-    slot_pending = true;
+    atomic_store(&slot_pending, true);
     GG_LOGD(
         "Persisted pending status %.*s for job %.*s.",
         (int) status.len,
@@ -104,7 +103,7 @@ GgError status_keeper_read(GgArena *alloc, GgBuffer *job_id, GgBuffer *status) {
         *status = gg_obj_into_buf(*status_obj);
     }
 
-    slot_pending = true;
+    atomic_store(&slot_pending, true);
     return GG_ERR_OK;
 }
 
@@ -113,7 +112,7 @@ GgError status_keeper_clear(void) {
 
     // Self-gated no-op when nothing is pending (see status_keeper.h for the
     // startup-sync requirement).
-    if (!slot_pending) {
+    if (!atomic_load(&slot_pending)) {
         return GG_ERR_OK;
     }
 
@@ -125,12 +124,85 @@ GgError status_keeper_clear(void) {
         return ret;
     }
 
-    slot_pending = false;
+    atomic_store(&slot_pending, false);
     GG_LOGD("Cleared pending deployment status slot.");
     return GG_ERR_OK;
 }
 
 bool status_keeper_has_pending(void) {
-    GG_MTX_SCOPE_GUARD(&slot_mtx);
-    return slot_pending;
+    return atomic_load(&slot_pending);
 }
+
+#ifdef GG_SDK_TESTING
+
+#include <gg/test.h>
+#include <time.h>
+#include <unity.h>
+
+static pthread_mutex_t has_pending_test_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t has_pending_test_cond = PTHREAD_COND_INITIALIZER;
+static bool has_pending_test_returned;
+static bool has_pending_test_result;
+
+static void *has_pending_test_worker(void *ctx) {
+    (void) ctx;
+
+    bool pending = status_keeper_has_pending();
+
+    pthread_mutex_lock(&has_pending_test_mtx);
+    has_pending_test_result = pending;
+    has_pending_test_returned = true;
+    pthread_cond_signal(&has_pending_test_cond);
+    pthread_mutex_unlock(&has_pending_test_mtx);
+    return NULL;
+}
+
+GG_TEST_DEFINE(status_keeper_has_pending_does_not_wait_for_slot_mutex) {
+    struct timespec deadline;
+    TEST_ASSERT_EQUAL_INT(0, clock_gettime(CLOCK_REALTIME, &deadline));
+    deadline.tv_sec += 1;
+
+    pthread_mutex_lock(&has_pending_test_mtx);
+    has_pending_test_returned = false;
+    has_pending_test_result = false;
+    pthread_mutex_unlock(&has_pending_test_mtx);
+    atomic_store(&slot_pending, true);
+
+    int slot_lock_ret = pthread_mutex_lock(&slot_mtx);
+    int create_ret = -1;
+    int slot_unlock_ret = -1;
+    int join_ret = -1;
+    bool returned_while_locked = false;
+    pthread_t worker;
+
+    if (slot_lock_ret == 0) {
+        create_ret
+            = pthread_create(&worker, NULL, has_pending_test_worker, NULL);
+        if (create_ret == 0) {
+            pthread_mutex_lock(&has_pending_test_mtx);
+            int wait_ret = 0;
+            while (!has_pending_test_returned && (wait_ret == 0)) {
+                wait_ret = pthread_cond_timedwait(
+                    &has_pending_test_cond, &has_pending_test_mtx, &deadline
+                );
+            }
+            returned_while_locked = has_pending_test_returned;
+            pthread_mutex_unlock(&has_pending_test_mtx);
+        }
+        slot_unlock_ret = pthread_mutex_unlock(&slot_mtx);
+    }
+
+    if (create_ret == 0) {
+        join_ret = pthread_join(worker, NULL);
+    }
+    atomic_store(&slot_pending, false);
+
+    TEST_ASSERT_EQUAL_INT(0, slot_lock_ret);
+    TEST_ASSERT_EQUAL_INT(0, create_ret);
+    TEST_ASSERT_TRUE(returned_while_locked);
+    TEST_ASSERT_EQUAL_INT(0, slot_unlock_ret);
+    TEST_ASSERT_EQUAL_INT(0, join_ret);
+    TEST_ASSERT_TRUE(has_pending_test_result);
+}
+
+#endif

@@ -10,6 +10,10 @@
 
 void *job_listener_thread(void *ctx);
 
+/// Block until the listener has published the thing name and synchronized the
+/// persisted pending-status slot.
+void ggl_iot_jobs_wait_for_listener_ready(void);
+
 GgError update_current_jobs_deployment(GgBuffer deployment_id, GgBuffer status);
 
 /// Publish an IoT Jobs status update for the current deployment via the given
@@ -21,6 +25,9 @@ GgError update_current_jobs_deployment_to(
 GgError set_jobs_deployment_for_bootstrap(
     GgBuffer job_id, GgBuffer deployment_id
 );
+
+/// Release Jobs notifications after the persisted deployment scan completes.
+void ggl_iot_jobs_bootstrap_scan_complete(void);
 
 /// Set the current job/deployment IDs for status reporting. Called at dequeue
 /// time so the IDs reflect the job being actively processed.

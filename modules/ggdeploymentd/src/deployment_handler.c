@@ -8,7 +8,9 @@
 #include "bootstrap_manager.h"
 #include "component_config.h"
 #include "component_manager.h"
+#include "config_access.h"
 #include "credential_endpoint_validation.h"
+#include "dataplane_response.h"
 #include "deployment_model.h"
 #include "deployment_queue.h"
 #include "iot_jobs_listener.h"
@@ -37,6 +39,7 @@
 #include <gg/utils.h>
 #include <gg/vector.h>
 #include <ggl/core_bus/client.h>
+#include <ggl/core_bus/constants.h>
 #include <ggl/core_bus/gg_config.h>
 #include <ggl/core_bus/gg_healthd.h>
 #include <ggl/core_bus/sub_response.h>
@@ -211,67 +214,39 @@ static GgError get_posix_user(char **posix_user) {
 }
 
 static GgError get_data_endpoint(GgByteVec *endpoint) {
-    GgMap params = GG_MAP(gg_kv(
-        GG_STR("key_path"),
-        gg_obj_list(GG_LIST(
-            gg_obj_buf(GG_STR("services")),
-            gg_obj_buf(GG_STR("aws.greengrass.NucleusLite")),
-            gg_obj_buf(GG_STR("configuration")),
-            gg_obj_buf(GG_STR("iotDataEndpoint"))
-        ))
-    ));
-
-    static uint8_t resp_mem[128] = { 0 };
-    GgArena alloc = gg_arena_init(
-        gg_buffer_substr(GG_BUF(resp_mem), 0, sizeof(resp_mem) - 1)
-    );
-
-    GgObject resp;
-    GgError ret = ggl_call(
-        GG_STR("gg_config"), GG_STR("read"), params, NULL, &alloc, &resp
+    static uint8_t response_scratch[128];
+    GgError ret = ggl_deployment_config_read_string(
+        GG_BUF_LIST(
+            GG_STR("services"),
+            GG_STR("aws.greengrass.NucleusLite"),
+            GG_STR("configuration"),
+            GG_STR("iotDataEndpoint")
+        ),
+        GG_BUF(response_scratch),
+        endpoint
     );
     if (ret != GG_ERR_OK) {
         GG_LOGW("Failed to get dataplane endpoint from config.");
-        return ret;
     }
-    if (gg_obj_type(resp) != GG_TYPE_BUF) {
-        GG_LOGE("Configuration dataplane endpoint is not a string.");
-        return GG_ERR_INVALID;
-    }
-
-    return gg_byte_vec_append(endpoint, gg_obj_into_buf(resp));
+    return ret;
 }
 
 static GgError get_data_port(GgByteVec *port) {
-    GgMap params = GG_MAP(gg_kv(
-        GG_STR("key_path"),
-        gg_obj_list(GG_LIST(
-            gg_obj_buf(GG_STR("services")),
-            gg_obj_buf(GG_STR("aws.greengrass.NucleusLite")),
-            gg_obj_buf(GG_STR("configuration")),
-            gg_obj_buf(GG_STR("greengrassDataPlanePort"))
-        ))
-    ));
-
-    static uint8_t resp_mem[128] = { 0 };
-    GgArena alloc = gg_arena_init(
-        gg_buffer_substr(GG_BUF(resp_mem), 0, sizeof(resp_mem) - 1)
-    );
-
-    GgObject resp;
-    GgError ret = ggl_call(
-        GG_STR("gg_config"), GG_STR("read"), params, NULL, &alloc, &resp
+    static uint8_t response_scratch[128];
+    GgError ret = ggl_deployment_config_read_string(
+        GG_BUF_LIST(
+            GG_STR("services"),
+            GG_STR("aws.greengrass.NucleusLite"),
+            GG_STR("configuration"),
+            GG_STR("greengrassDataPlanePort")
+        ),
+        GG_BUF(response_scratch),
+        port
     );
     if (ret != GG_ERR_OK) {
         GG_LOGW("Failed to get dataplane port from config.");
-        return ret;
     }
-    if (gg_obj_type(resp) != GG_TYPE_BUF) {
-        GG_LOGE("Configuration dataplane port is not a string.");
-        return GG_ERR_INVALID;
-    }
-
-    return gg_byte_vec_append(port, gg_obj_into_buf(resp));
+    return ret;
 }
 
 static GgError get_private_key_path(GgByteVec *pkey_path) {
@@ -708,6 +683,48 @@ static void recursive_chown(int dir_fd, uid_t uid, gid_t gid) {
     closedir(dir);
 }
 
+static GgError get_artifact_permission_mode(
+    GgObject *permission_obj, mode_t *mode
+) {
+    if (mode == NULL) {
+        return GG_ERR_INVALID;
+    }
+
+    *mode = 0755;
+    if (permission_obj == NULL) {
+        return GG_ERR_OK;
+    }
+    if (gg_obj_type(*permission_obj) != GG_TYPE_MAP) {
+        return GG_ERR_PARSE;
+    }
+
+    return artifact_permission_to_mode(gg_obj_into_map(*permission_obj), mode);
+}
+
+static GgError apply_remaining_component_configurations(
+    GgMap component_to_configuration, GgMap resolved_components
+) {
+    GG_MAP_FOREACH (config_pair, component_to_configuration) {
+        if (gg_map_get(resolved_components, gg_kv_key(*config_pair), NULL)) {
+            continue;
+        }
+
+        GgError ret = apply_component_to_configuration(
+            gg_kv_key(*config_pair), component_to_configuration
+        );
+        if (ret != GG_ERR_OK) {
+            GG_LOGE(
+                "Failed to apply component_to_configuration for %.*s.",
+                (int) gg_kv_key(*config_pair).len,
+                gg_kv_key(*config_pair).data
+            );
+            return ret;
+        }
+    }
+
+    return GG_ERR_OK;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static GgError get_recipe_artifacts(
     GgBuffer component_arn,
@@ -884,10 +901,11 @@ static GgError get_recipe_artifacts(
         // nucleus lite deployments. Note: Greengrass Nucleus defaults to
         // Read:OWNER, Execute:NONE (0440). This difference is intentional to
         // avoid regression.
-        mode_t mode = 0755;
-        if (permission_obj != NULL) {
-            mode
-                = artifact_permission_to_mode(gg_obj_into_map(*permission_obj));
+        mode_t mode;
+        err = get_artifact_permission_mode(permission_obj, &mode);
+        if (err != GG_ERR_OK) {
+            GG_LOGE("Invalid artifact permission in component recipe.");
+            return err;
         }
         int artifact_fd = -1;
         err = gg_file_openat(
@@ -1286,211 +1304,206 @@ static GgError resolve_component_with_cloud(
     return GG_ERR_OK;
 }
 
+#ifdef GG_SDK_TESTING
+
+static GgError (*dataplane_config_write)(
+    GgBufList key_path, GgObject value, const int64_t *timestamp
+) = ggl_gg_config_write;
+static GgError (*thing_groups_config_write)(
+    GgBufList key_path, GgObject value, const int64_t *timestamp
+) = ggl_gg_config_write;
+static GgError (*configarn_config_write)(
+    GgBufList key_path, GgObject value, const int64_t *timestamp
+) = ggl_gg_config_write;
+
+#else
+
+// NOLINTBEGIN(readability-identifier-naming)
+#define dataplane_config_write ggl_gg_config_write
+#define thing_groups_config_write ggl_gg_config_write
+#define configarn_config_write ggl_gg_config_write
+// NOLINTEND(readability-identifier-naming)
+
+#endif
+
 static GgError parse_dataplane_response_and_save_recipe(
     GgBuffer dataplane_response,
     GglDeploymentHandlerThreadArgs *args,
     GgBuffer *cloud_version
 ) {
-    GgObject json_candidates_response_obj;
     // TODO: Figure out a better size. This response can be big.
     uint8_t candidates_response_mem[100 * sizeof(GgObject)];
     GgArena alloc = gg_arena_init(GG_BUF(candidates_response_mem));
-    GgError ret = gg_json_decode_destructive(
-        dataplane_response, &alloc, &json_candidates_response_obj
+    GgObject *resolved_component_versions;
+    GgError ret = ggl_dataplane_response_get_typed_field(
+        dataplane_response,
+        &alloc,
+        GG_STR("resolvedComponentVersions"),
+        GG_TYPE_LIST,
+        &resolved_component_versions
     );
     if (ret != GG_ERR_OK) {
+        GG_LOGE("Invalid resolveComponentCandidates response schema.");
+        return ret;
+    }
+
+    GgList resolved_versions = gg_obj_into_list(*resolved_component_versions);
+    if (resolved_versions.len == 0) {
+        GG_LOGE("resolvedComponentVersions list is empty.");
+        return GG_ERR_PARSE;
+    }
+    if (resolved_versions.len > 1) {
         GG_LOGE(
-            "Error when parsing resolveComponentCandidates response to json."
+            "resolveComponentCandidates returned information for more than one component."
         );
+        return GG_ERR_INVALID;
+    }
+
+    GgObject *resolved_version = &resolved_versions.items[0];
+    if (gg_obj_type(*resolved_version) != GG_TYPE_MAP) {
+        GG_LOGE("Resolved version is not of type map.");
+        return GG_ERR_PARSE;
+    }
+
+    GgObject *cloud_component_arn_obj;
+    GgObject *cloud_component_name_obj;
+    GgObject *cloud_component_version_obj;
+    GgObject *vendor_guidance_obj;
+    GgObject *recipe_obj;
+
+    ret = gg_map_validate(
+        gg_obj_into_map(*resolved_version),
+        GG_MAP_SCHEMA(
+            { GG_STR("arn"),
+              GG_REQUIRED,
+              GG_TYPE_BUF,
+              &cloud_component_arn_obj },
+            { GG_STR("componentName"),
+              GG_REQUIRED,
+              GG_TYPE_BUF,
+              &cloud_component_name_obj },
+            { GG_STR("componentVersion"),
+              GG_REQUIRED,
+              GG_TYPE_BUF,
+              &cloud_component_version_obj },
+            { GG_STR("vendorGuidance"),
+              GG_OPTIONAL,
+              GG_TYPE_BUF,
+              &vendor_guidance_obj },
+            { GG_STR("recipe"), GG_REQUIRED, GG_TYPE_BUF, &recipe_obj },
+        )
+    );
+    if (ret != GG_ERR_OK) {
+        GG_LOGE("Invalid resolved component version schema.");
+        return GG_ERR_PARSE;
+    }
+
+    GgBuffer cloud_component_arn = gg_obj_into_buf(*cloud_component_arn_obj);
+    GgBuffer cloud_component_name = gg_obj_into_buf(*cloud_component_name_obj);
+    GgBuffer cloud_component_version
+        = gg_obj_into_buf(*cloud_component_version_obj);
+    GgBuffer recipe_file_content = gg_obj_into_buf(*recipe_obj);
+
+    ret = ggl_deployment_copy_buffer(cloud_component_version, cloud_version);
+    if (ret != GG_ERR_OK) {
         return ret;
     }
 
-    if (gg_obj_type(json_candidates_response_obj) != GG_TYPE_MAP) {
-        GG_LOGE("resolveComponentCandidates response did not parse into a map."
-        );
-        return ret;
-    }
-
-    GgObject *resolved_component_versions;
-    if (!gg_map_get(
-            gg_obj_into_map(json_candidates_response_obj),
-            GG_STR("resolvedComponentVersions"),
-            &resolved_component_versions
-        )) {
-        GG_LOGE("Missing resolvedComponentVersions.");
-        return ret;
-    }
-    if (gg_obj_type(*resolved_component_versions) != GG_TYPE_LIST) {
-        GG_LOGE("resolvedComponentVersions response is not a list.");
-        return ret;
-    }
-
-    bool first_component = true;
-    GG_LIST_FOREACH (
-        resolved_version, gg_obj_into_list(*resolved_component_versions)
-    ) {
-        if (!first_component) {
-            GG_LOGE(
-                "resolveComponentCandidates returned information for more than one component."
+    if (vendor_guidance_obj != NULL) {
+        if (gg_buffer_eq(
+                gg_obj_into_buf(*vendor_guidance_obj), GG_STR("DISCONTINUED")
+            )) {
+            GG_LOGW(
+                "The component version has been discontinued by its publisher. You can deploy this component version, but we recommend that you use a different version of this component"
             );
-            return GG_ERR_INVALID;
         }
-        first_component = false;
+    }
 
-        if (gg_obj_type(*resolved_version) != GG_TYPE_MAP) {
-            GG_LOGE("Resolved version is not of type map.");
+    if (recipe_file_content.len == 0) {
+        GG_LOGE("Recipe is empty.");
+        return GG_ERR_INVALID;
+    }
+
+    bool decoded = gg_base64_decode_in_place(&recipe_file_content);
+    if (!decoded) {
+        GG_LOGE("Failed to decode recipe base64.");
+        return GG_ERR_PARSE;
+    }
+    recipe_file_content.data[recipe_file_content.len] = '\0';
+
+    GG_LOGD(
+        "Decoded recipe data as: %.*s",
+        (int) recipe_file_content.len,
+        recipe_file_content.data
+    );
+
+    static uint8_t recipe_name_buf[PATH_MAX];
+    GgByteVec recipe_name_vec = GG_BYTE_VEC(recipe_name_buf);
+    ret = gg_byte_vec_append(&recipe_name_vec, cloud_component_name);
+    gg_byte_vec_chain_append(&ret, &recipe_name_vec, GG_STR("-"));
+    gg_byte_vec_chain_append(&ret, &recipe_name_vec, cloud_component_version);
+    gg_byte_vec_chain_append(&ret, &recipe_name_vec, GG_STR(".json"));
+    if (ret != GG_ERR_OK) {
+        GG_LOGE("Failed to create recipe file name.");
+        return ret;
+    }
+
+    static uint8_t recipe_dir_buf[PATH_MAX];
+    GgByteVec recipe_dir_vec = GG_BYTE_VEC(recipe_dir_buf);
+    ret = gg_byte_vec_append(
+        &recipe_dir_vec, gg_buffer_from_null_term((char *) args->root_path.data)
+    );
+    gg_byte_vec_chain_append(
+        &ret, &recipe_dir_vec, GG_STR("/packages/recipes/")
+    );
+    if (ret != GG_ERR_OK) {
+        GG_LOGE("Failed to create recipe directory name.");
+        return ret;
+    }
+
+    {
+        // Write file
+        int root_dir_fd = -1;
+        ret = gg_dir_open(recipe_dir_vec.buf, O_PATH, true, &root_dir_fd);
+        if (ret != GG_ERR_OK) {
+            GG_LOGE("Failed to open dir when writing cloud recipe.");
             return ret;
         }
+        GG_CLEANUP(cleanup_close, root_dir_fd);
 
-        GgObject *cloud_component_arn_obj;
-        GgObject *cloud_component_name_obj;
-        GgObject *cloud_component_version_obj;
-        GgObject *vendor_guidance_obj;
-        GgObject *recipe_obj;
-
-        ret = gg_map_validate(
-            gg_obj_into_map(*resolved_version),
-            GG_MAP_SCHEMA(
-                { GG_STR("arn"),
-                  GG_REQUIRED,
-                  GG_TYPE_BUF,
-                  &cloud_component_arn_obj },
-                { GG_STR("componentName"),
-                  GG_REQUIRED,
-                  GG_TYPE_BUF,
-                  &cloud_component_name_obj },
-                { GG_STR("componentVersion"),
-                  GG_REQUIRED,
-                  GG_TYPE_BUF,
-                  &cloud_component_version_obj },
-                { GG_STR("vendorGuidance"),
-                  GG_OPTIONAL,
-                  GG_TYPE_BUF,
-                  &vendor_guidance_obj },
-                { GG_STR("recipe"), GG_REQUIRED, GG_TYPE_BUF, &recipe_obj },
-            )
+        int fd = -1;
+        ret = gg_file_openat(
+            root_dir_fd,
+            recipe_name_vec.buf,
+            O_CREAT | O_WRONLY | O_TRUNC,
+            (mode_t) 0644,
+            &fd
         );
         if (ret != GG_ERR_OK) {
-            return ret;
-        }
-        GgBuffer cloud_component_arn
-            = gg_obj_into_buf(*cloud_component_arn_obj);
-        GgBuffer cloud_component_name
-            = gg_obj_into_buf(*cloud_component_name_obj);
-        GgBuffer cloud_component_version
-            = gg_obj_into_buf(*cloud_component_version_obj);
-        GgBuffer recipe_file_content = gg_obj_into_buf(*recipe_obj);
-
-        assert(cloud_component_version.len <= NAME_MAX);
-
-        memcpy(
-            cloud_version->data,
-            cloud_component_version.data,
-            cloud_component_version.len
-        );
-        cloud_version->len = cloud_component_version.len;
-
-        if (vendor_guidance_obj != NULL) {
-            if (gg_buffer_eq(
-                    gg_obj_into_buf(*vendor_guidance_obj),
-                    GG_STR("DISCONTINUED")
-                )) {
-                GG_LOGW(
-                    "The component version has been discontinued by its publisher. You can deploy this component version, but we recommend that you use a different version of this component"
-                );
-            }
-        }
-
-        if (recipe_file_content.len == 0) {
-            GG_LOGE("Recipe is empty.");
-        }
-
-        bool decoded = gg_base64_decode_in_place(&recipe_file_content);
-        if (!decoded) {
-            GG_LOGE("Failed to decode recipe base64.");
-            return GG_ERR_PARSE;
-        }
-        recipe_file_content.data[recipe_file_content.len] = '\0';
-
-        GG_LOGD(
-            "Decoded recipe data as: %.*s",
-            (int) recipe_file_content.len,
-            recipe_file_content.data
-        );
-
-        static uint8_t recipe_name_buf[PATH_MAX];
-        GgByteVec recipe_name_vec = GG_BYTE_VEC(recipe_name_buf);
-        ret = gg_byte_vec_append(&recipe_name_vec, cloud_component_name);
-        gg_byte_vec_chain_append(&ret, &recipe_name_vec, GG_STR("-"));
-        gg_byte_vec_chain_append(
-            &ret, &recipe_name_vec, cloud_component_version
-        );
-        gg_byte_vec_chain_append(&ret, &recipe_name_vec, GG_STR(".json"));
-        if (ret != GG_ERR_OK) {
-            GG_LOGE("Failed to create recipe file name.");
-            return ret;
-        }
-
-        static uint8_t recipe_dir_buf[PATH_MAX];
-        GgByteVec recipe_dir_vec = GG_BYTE_VEC(recipe_dir_buf);
-        ret = gg_byte_vec_append(
-            &recipe_dir_vec,
-            gg_buffer_from_null_term((char *) args->root_path.data)
-        );
-        gg_byte_vec_chain_append(
-            &ret, &recipe_dir_vec, GG_STR("/packages/recipes/")
-        );
-        if (ret != GG_ERR_OK) {
-            GG_LOGE("Failed to create recipe directory name.");
-            return ret;
-        }
-
-        {
-            // Write file
-            int root_dir_fd = -1;
-            ret = gg_dir_open(recipe_dir_vec.buf, O_PATH, true, &root_dir_fd);
-            if (ret != GG_ERR_OK) {
-                GG_LOGE("Failed to open dir when writing cloud recipe.");
-                return ret;
-            }
-            GG_CLEANUP(cleanup_close, root_dir_fd);
-
-            int fd = -1;
-            ret = gg_file_openat(
-                root_dir_fd,
-                recipe_name_vec.buf,
-                O_CREAT | O_WRONLY | O_TRUNC,
-                (mode_t) 0644,
-                &fd
+            GG_LOGE("Failed to open file at the dir when writing cloud recipe."
             );
-            if (ret != GG_ERR_OK) {
-                GG_LOGE(
-                    "Failed to open file at the dir when writing cloud recipe."
-                );
-                return ret;
-            }
-            GG_CLEANUP(cleanup_close, fd);
-
-            ret = gg_file_write(fd, recipe_file_content);
-            if (ret != GG_ERR_OK) {
-                GG_LOGE("Write to cloud recipe file failed");
-                return ret;
-            }
-        }
-
-        GG_LOGD("Saved recipe under the name %s", recipe_name_vec.buf.data);
-
-        ret = ggl_gg_config_write(
-            GG_BUF_LIST(GG_STR("services"), cloud_component_name, ),
-            gg_obj_map(
-                GG_MAP(gg_kv(GG_STR("arn"), gg_obj_buf(cloud_component_arn)))
-            ),
-            &(int64_t) { 1 }
-        );
-        if (ret != GG_ERR_OK) {
-            GG_LOGE("Write of arn to config failed");
             return ret;
         }
+        GG_CLEANUP(cleanup_close, fd);
+
+        ret = gg_file_write(fd, recipe_file_content);
+        if (ret != GG_ERR_OK) {
+            GG_LOGE("Write to cloud recipe file failed");
+            return ret;
+        }
+    }
+
+    GG_LOGD("Saved recipe under the name %s", recipe_name_vec.buf.data);
+
+    ret = dataplane_config_write(
+        GG_BUF_LIST(GG_STR("services"), cloud_component_name, ),
+        gg_obj_map(GG_MAP(gg_kv(GG_STR("arn"), gg_obj_buf(cloud_component_arn)))
+        ),
+        &(int64_t) { 1 }
+    );
+    if (ret != GG_ERR_OK) {
+        GG_LOGE("Write of arn to config failed");
+        return ret;
     }
 
     return GG_ERR_OK;
@@ -1501,39 +1514,21 @@ static GgError parse_thing_groups_list(
     GgArena *alloc,
     GgObject **thing_groups_list
 ) {
-    // TODO: Add a schema and only parse the fields we need to save memory
-    GgObject json_thing_groups_object;
-    GgError ret = gg_json_decode_destructive(
-        list_thing_groups_response, alloc, &json_thing_groups_object
+    GgError ret = ggl_dataplane_response_get_typed_field(
+        list_thing_groups_response,
+        alloc,
+        GG_STR("thingGroups"),
+        GG_TYPE_LIST,
+        thing_groups_list
     );
     if (ret != GG_ERR_OK) {
-        GG_LOGE("Error when parsing listThingGroups response to json.");
-        return ret;
+        GG_LOGE("Invalid listThingGroups response schema.");
     }
-
-    if (gg_obj_type(json_thing_groups_object) != GG_TYPE_MAP) {
-        GG_LOGE("listThingGroups response did not parse into a map.");
-        return ret;
-    }
-
-    if (!gg_map_get(
-            gg_obj_into_map(json_thing_groups_object),
-            GG_STR("thingGroups"),
-            thing_groups_list
-        )) {
-        GG_LOGE("Missing thingGroups.");
-        return ret;
-    }
-    if (gg_obj_type(**thing_groups_list) != GG_TYPE_LIST) {
-        GG_LOGE("thingGroups response is not a list.");
-        return ret;
-    }
-
-    return GG_ERR_OK;
+    return ret;
 }
 
 static GgError add_thing_groups_list_to_config(GgObject *thing_groups_list) {
-    GgError ret = ggl_gg_config_write(
+    GgError ret = thing_groups_config_write(
         GG_BUF_LIST(
             GG_STR("services"),
             GG_STR("DeploymentService"),
@@ -1548,6 +1543,468 @@ static GgError add_thing_groups_list_to_config(GgObject *thing_groups_list) {
     }
 
     return GG_ERR_OK;
+}
+
+static GgError read_cached_thing_groups(
+    GgArena *alloc, GgObject *thing_groups
+) {
+    GgError ret = ggl_deployment_config_read_object(
+        GG_BUF_LIST(
+            GG_STR("services"),
+            GG_STR("DeploymentService"),
+            GG_STR("lastThingGroupsListFromCloud")
+        ),
+        alloc,
+        GG_TYPE_LIST,
+        thing_groups
+    );
+    if (ret == GG_ERR_NOENTRY) {
+        *thing_groups = gg_obj_list((GgList) { 0 });
+        return GG_ERR_OK;
+    }
+    return ret;
+}
+
+#ifdef GG_SDK_TESTING
+
+static GgError (*resolve_get_device_thing_groups)(GgBuffer *response)
+    = get_device_thing_groups;
+static GgError (*resolve_config_read)(
+    GgBufList key_path, GgArena *alloc, GgObject *result
+) = ggl_gg_config_read;
+static GgError (*resolve_config_delete)(GgBufList key_path)
+    = ggl_gg_config_delete;
+static GgError (*resolve_config_write)(
+    GgBufList key_path, GgObject value, const int64_t *timestamp
+) = ggl_gg_config_write;
+
+#else
+
+// NOLINTBEGIN(readability-identifier-naming)
+#define resolve_get_device_thing_groups get_device_thing_groups
+#define resolve_config_read ggl_gg_config_read
+#define resolve_config_delete ggl_gg_config_delete
+#define resolve_config_write ggl_gg_config_write
+// NOLINTEND(readability-identifier-naming)
+
+#endif
+
+static GgError collect_deployment_root_components(
+    GgMap root_components, GgKVVec *components_to_resolve
+) {
+    GG_MAP_FOREACH (pair, root_components) {
+        if (gg_obj_type(*gg_kv_val(pair)) != GG_TYPE_MAP) {
+            GG_LOGE("Incorrect formatting for deployment components field.");
+            return GG_ERR_INVALID;
+        }
+
+        GgObject *version_obj;
+        GgBuffer component_version = { 0 };
+        if (gg_map_get(
+                gg_obj_into_map(*gg_kv_val(pair)),
+                GG_STR("version"),
+                &version_obj
+            )) {
+            if (gg_obj_type(*version_obj) != GG_TYPE_BUF) {
+                GG_LOGE("Received invalid argument.");
+                return GG_ERR_INVALID;
+            }
+            component_version = gg_obj_into_buf(*version_obj);
+        }
+
+        if (gg_buffer_eq(
+                gg_kv_key(*pair), GG_STR("aws.greengrass.NucleusLite")
+            )) {
+            GgBuffer software_version = GG_STR(GGL_VERSION);
+            if (!gg_buffer_eq(component_version, software_version)) {
+                GG_LOGE(
+                    "The deployment failed. The aws.greengrass.NucleusLite component version specified in the deployment is %.*s, but the version of the Greengrass nucleus lite software is %.*s. Please ensure that the version in the deployment matches before attempting the deployment again.",
+                    (int) component_version.len,
+                    component_version.data,
+                    (int) software_version.len,
+                    software_version.data
+                );
+                return GG_ERR_INVALID;
+            }
+        }
+
+        GgError ret = gg_kv_vec_push(
+            components_to_resolve,
+            gg_kv(gg_kv_key(*pair), gg_obj_buf(component_version))
+        );
+        if (ret != GG_ERR_OK) {
+            return ret;
+        }
+    }
+    return GG_ERR_OK;
+}
+
+static GgError merge_root_component_requirement(
+    GgKVVec *components_to_resolve,
+    GgBuffer component_name,
+    GgBuffer version_requirement,
+    GgArena *name_alloc,
+    GgArena *version_alloc,
+    bool *added
+) {
+    *added = false;
+    GgObject *existing_version_obj;
+    GgError ret = gg_map_validate(
+        components_to_resolve->map,
+        GG_MAP_SCHEMA(
+            { component_name, GG_OPTIONAL, GG_TYPE_BUF, &existing_version_obj },
+        )
+    );
+    if (ret != GG_ERR_OK) {
+        return ret;
+    }
+
+    if (existing_version_obj != NULL) {
+        GgBuffer existing_version = gg_obj_into_buf(*existing_version_obj);
+        if (gg_buffer_eq(existing_version, version_requirement)) {
+            return GG_ERR_OK;
+        }
+        GG_LOGE(
+            "Root component %.*s has conflicting version requirements %.*s and %.*s.",
+            (int) component_name.len,
+            component_name.data,
+            (int) existing_version.len,
+            existing_version.data,
+            (int) version_requirement.len,
+            version_requirement.data
+        );
+        return GG_ERR_INVALID;
+    }
+
+    ret = gg_arena_claim_buf(&component_name, name_alloc);
+    if (ret != GG_ERR_OK) {
+        return ret;
+    }
+    ret = gg_arena_claim_buf(&version_requirement, version_alloc);
+    if (ret != GG_ERR_OK) {
+        return ret;
+    }
+    ret = gg_kv_vec_push(
+        components_to_resolve,
+        gg_kv(component_name, gg_obj_buf(version_requirement))
+    );
+    if (ret != GG_ERR_OK) {
+        return ret;
+    }
+    *added = true;
+    return GG_ERR_OK;
+}
+
+static GgError merge_root_component_map(
+    GgMap roots,
+    GgBuffer source,
+    GgKVVec *components_to_resolve,
+    GgArena *name_alloc,
+    GgArena *version_alloc
+) {
+    GG_MAP_FOREACH (root, roots) {
+        if (gg_obj_type(*gg_kv_val(root)) != GG_TYPE_BUF) {
+            GG_LOGE("Root component version is not a string.");
+            return GG_ERR_INVALID;
+        }
+        bool added;
+        GgError ret = merge_root_component_requirement(
+            components_to_resolve,
+            gg_kv_key(*root),
+            gg_obj_into_buf(*gg_kv_val(root)),
+            name_alloc,
+            version_alloc,
+            &added
+        );
+        if (ret != GG_ERR_OK) {
+            return ret;
+        }
+        if (added) {
+            GG_LOGD(
+                "Added %.*s to the root components from %.*s.",
+                (int) gg_kv_key(*root).len,
+                gg_kv_key(*root).data,
+                (int) source.len,
+                source.data
+            );
+        }
+    }
+    return GG_ERR_OK;
+}
+
+static GgError replace_thing_group_root_mapping(
+    GgBuffer thing_group_name, GgMap replacement
+) {
+    static uint8_t previous_thing_group_root_mapping_mem
+        [GGL_COREBUS_MAX_MSG_LEN
+         + ((size_t) GGL_MAX_GENERIC_COMPONENTS * sizeof(GgKV))];
+    GgArena previous_thing_group_root_mapping_alloc
+        = gg_arena_init(GG_BUF(previous_thing_group_root_mapping_mem));
+
+    GgObject previous_mapping;
+    GgError previous_ret = resolve_config_read(
+        GG_BUF_LIST(
+            GG_STR("services"),
+            GG_STR("DeploymentService"),
+            GG_STR("thingGroupsToRootComponents"),
+            thing_group_name
+        ),
+        &previous_thing_group_root_mapping_alloc,
+        &previous_mapping
+    );
+    if ((previous_ret != GG_ERR_OK) && (previous_ret != GG_ERR_NOENTRY)) {
+        GG_LOGE("Failed to read the previous thing group root mapping.");
+        return previous_ret;
+    }
+
+    GgError ret = resolve_config_delete(GG_BUF_LIST(
+        GG_STR("services"),
+        GG_STR("DeploymentService"),
+        GG_STR("thingGroupsToRootComponents"),
+        thing_group_name
+    ));
+    if (ret != GG_ERR_OK) {
+        GG_LOGW(
+            "Error while deleting thing group to root components mapping for thing group %.*s",
+            (int) thing_group_name.len,
+            thing_group_name.data
+        );
+        return ret;
+    }
+
+    ret = resolve_config_write(
+        GG_BUF_LIST(
+            GG_STR("services"),
+            GG_STR("DeploymentService"),
+            GG_STR("thingGroupsToRootComponents"),
+            thing_group_name
+        ),
+        gg_obj_map(replacement),
+        0
+    );
+    if (ret == GG_ERR_OK) {
+        return GG_ERR_OK;
+    }
+
+    GG_LOGE("Failed to write thing group to root components map to ggconfigd.");
+    if (previous_ret == GG_ERR_OK) {
+        GgError restore_ret = resolve_config_write(
+            GG_BUF_LIST(
+                GG_STR("services"),
+                GG_STR("DeploymentService"),
+                GG_STR("thingGroupsToRootComponents"),
+                thing_group_name
+            ),
+            previous_mapping,
+            0
+        );
+        if (restore_ret != GG_ERR_OK) {
+            GG_LOGE("Failed to restore the previous thing group root mapping.");
+        }
+    }
+    return ret;
+}
+
+static GgError merge_thing_group_root_components(
+    GgList thing_groups,
+    GgBuffer current_thing_group,
+    GgKVVec *components_to_resolve,
+    GgArena *alloc,
+    GgArena *version_alloc
+) {
+    GG_LIST_FOREACH (thing_group_item, thing_groups) {
+        if (gg_obj_type(*thing_group_item) != GG_TYPE_MAP) {
+            GG_LOGE("Thing group item is not of type map.");
+            return GG_ERR_INVALID;
+        }
+
+        GgObject *name_obj;
+        GgError ret = gg_map_validate(
+            gg_obj_into_map(*thing_group_item),
+            GG_MAP_SCHEMA(
+                { GG_STR("thingGroupName"),
+                  GG_REQUIRED,
+                  GG_TYPE_BUF,
+                  &name_obj },
+            )
+        );
+        if (ret != GG_ERR_OK) {
+            return ret;
+        }
+        GgBuffer name = gg_obj_into_buf(*name_obj);
+        if (gg_buffer_eq(name, current_thing_group)) {
+            continue;
+        }
+
+        GgObject roots;
+        ret = resolve_config_read(
+            GG_BUF_LIST(
+                GG_STR("services"),
+                GG_STR("DeploymentService"),
+                GG_STR("thingGroupsToRootComponents"),
+                name
+            ),
+            alloc,
+            &roots
+        );
+        if (ret != GG_ERR_OK) {
+            GG_LOGI(
+                "No info found in config for root components for thing group %.*s, assuming no components are part of this thing group.",
+                (int) name.len,
+                name.data
+            );
+            continue;
+        }
+        if (gg_obj_type(roots) != GG_TYPE_MAP) {
+            GG_LOGE(
+                "Did not read a map from config for thing group to root components map"
+            );
+            return GG_ERR_INVALID;
+        }
+        ret = merge_root_component_map(
+            gg_obj_into_map(roots),
+            name,
+            components_to_resolve,
+            alloc,
+            version_alloc
+        );
+        if (ret != GG_ERR_OK) {
+            return ret;
+        }
+    }
+    return GG_ERR_OK;
+}
+
+static GgError merge_local_root_components(
+    GgBuffer current_thing_group,
+    GgKVVec *components_to_resolve,
+    GgArena *alloc,
+    GgArena *version_alloc
+) {
+    if (gg_buffer_eq(GG_STR("LOCAL_DEPLOYMENTS"), current_thing_group)) {
+        return GG_ERR_OK;
+    }
+
+    GgObject roots;
+    GgError ret = resolve_config_read(
+        GG_BUF_LIST(
+            GG_STR("services"),
+            GG_STR("DeploymentService"),
+            GG_STR("thingGroupsToRootComponents"),
+            GG_STR("LOCAL_DEPLOYMENTS")
+        ),
+        alloc,
+        &roots
+    );
+    if (ret != GG_ERR_OK) {
+        GG_LOGI(
+            "No local components found in config, proceeding deployment without needing to add local components."
+        );
+        return GG_ERR_OK;
+    }
+    if (gg_obj_type(roots) != GG_TYPE_MAP) {
+        GG_LOGE(
+            "Did not read a map from config while looking up local components."
+        );
+        return GG_ERR_INVALID;
+    }
+    return merge_root_component_map(
+        gg_obj_into_map(roots),
+        GG_STR("LOCAL_DEPLOYMENTS"),
+        components_to_resolve,
+        alloc,
+        version_alloc
+    );
+}
+
+static void log_cloud_resolution_failure(GgBuffer component_name) {
+    GG_LOGI(
+        "Cloud version resolution failed for component %.*s.",
+        (int) component_name.len,
+        component_name.data
+    );
+}
+
+#ifdef GG_SDK_TESTING
+
+static bool (*resolve_local_component)(
+    GgBuffer component_name,
+    GgBuffer version_requirement,
+    GgBuffer *resolved_version
+) = resolve_component_version;
+static GgError (*resolve_cloud_component)(
+    GgBuffer component_name, GgBuffer version_requirement, GgBuffer *response
+) = resolve_component_with_cloud;
+static GgError (*parse_cloud_component)(
+    GgBuffer response,
+    GglDeploymentHandlerThreadArgs *args,
+    GgBuffer *resolved_version
+) = parse_dataplane_response_and_save_recipe;
+static void (*cloud_resolution_failure_logger)(GgBuffer component_name)
+    = log_cloud_resolution_failure;
+
+#else
+
+// NOLINTBEGIN(readability-identifier-naming)
+#define resolve_local_component resolve_component_version
+#define resolve_cloud_component resolve_component_with_cloud
+#define parse_cloud_component parse_dataplane_response_and_save_recipe
+#define cloud_resolution_failure_logger log_cloud_resolution_failure
+// NOLINTEND(readability-identifier-naming)
+
+#endif
+
+static GgError resolve_single_component_version(
+    GgBuffer component_name,
+    GgBuffer version_requirement,
+    GglDeploymentHandlerThreadArgs *args,
+    GgArena *alloc,
+    GgKVVec *resolved_components,
+    GgBuffer *resolved_version
+) {
+    bool found_local_candidate = resolve_local_component(
+        component_name, version_requirement, resolved_version
+    );
+    if (!found_local_candidate) {
+        static uint8_t response_mem[16384] = { 0 };
+        GgBuffer response = GG_BUF(response_mem);
+        GgError ret = resolve_cloud_component(
+            component_name, version_requirement, &response
+        );
+        if (ret != GG_ERR_OK) {
+            return ret;
+        }
+        if (gg_buffer_eq(response, GG_STR("{}"))) {
+            cloud_resolution_failure_logger(component_name);
+            return GG_ERR_FAILURE;
+        }
+        ret = parse_cloud_component(response, args, resolved_version);
+        if (ret != GG_ERR_OK) {
+            return ret;
+        }
+    }
+
+    if (!is_valid_semver(*resolved_version)) {
+        GG_LOGE(
+            "Resolved version for component %.*s is not a valid semantic version.",
+            (int) component_name.len,
+            component_name.data
+        );
+        return GG_ERR_INVALID;
+    }
+
+    GgError ret = gg_arena_claim_buf(resolved_version, alloc);
+    if (ret != GG_ERR_OK) {
+        return ret;
+    }
+    ret = gg_kv_vec_push(
+        resolved_components,
+        gg_kv(component_name, gg_obj_buf(*resolved_version))
+    );
+    if (ret != GG_ERR_OK) {
+        GG_LOGE("Error while adding component to list of resolved component");
+    }
+    return ret;
 }
 
 static GgError resolve_dependencies(
@@ -1574,83 +2031,17 @@ static GgError resolve_dependencies(
     GgArena version_requirements_alloc
         = gg_arena_init(GG_BUF(version_requirements_mem));
 
-    // Root components from current deployment
-    GG_MAP_FOREACH (pair, root_components) {
-        if (gg_obj_type(*gg_kv_val(pair)) != GG_TYPE_MAP) {
-            GG_LOGE("Incorrect formatting for deployment components field.");
-            return GG_ERR_INVALID;
-        }
-
-        GgObject *val;
-        GgBuffer component_version = { 0 };
-        if (gg_map_get(
-                gg_obj_into_map(*gg_kv_val(pair)), GG_STR("version"), &val
-            )) {
-            if (gg_obj_type(*val) != GG_TYPE_BUF) {
-                GG_LOGE("Received invalid argument.");
-                return GG_ERR_INVALID;
-            }
-            component_version = gg_obj_into_buf(*val);
-        }
-
-        if (gg_buffer_eq(
-                gg_kv_key(*pair), GG_STR("aws.greengrass.NucleusLite")
-            )) {
-            GgBuffer software_version = GG_STR(GGL_VERSION);
-            if (!gg_buffer_eq(component_version, software_version)) {
-                GG_LOGE(
-                    "The deployment failed. The aws.greengrass.NucleusLite component version specified in the deployment is %.*s, but the version of the Greengrass nucleus lite software is %.*s. Please ensure that the version in the deployment matches before attempting the deployment again.",
-                    (int) component_version.len,
-                    component_version.data,
-                    (int) software_version.len,
-                    software_version.data
-                );
-                return GG_ERR_INVALID;
-            }
-        }
-
-        ret = gg_kv_vec_push(
-            &components_to_resolve,
-            gg_kv(gg_kv_key(*pair), gg_obj_buf(component_version))
-        );
-        if (ret != GG_ERR_OK) {
-            return ret;
-        }
-    }
-
-    // At this point, components_to_resolve should be only a map of root
-    // component names to their version requirements from the deployment. This
-    // may be empty! We delete the key first in case components were removed.
-    ret = ggl_gg_config_delete(GG_BUF_LIST(
-        GG_STR("services"),
-        GG_STR("DeploymentService"),
-        GG_STR("thingGroupsToRootComponents"),
-        thing_group_name
-    ));
-
+    ret = collect_deployment_root_components(
+        root_components, &components_to_resolve
+    );
     if (ret != GG_ERR_OK) {
-        GG_LOGW(
-            "Error while deleting thing group to root components mapping for thing group %.*s",
-            (int) thing_group_name.len,
-            thing_group_name.data
-        );
         return ret;
     }
-    ret = ggl_gg_config_write(
-        GG_BUF_LIST(
-            GG_STR("services"),
-            GG_STR("DeploymentService"),
-            GG_STR("thingGroupsToRootComponents"),
-            thing_group_name
-        ),
-        gg_obj_map(components_to_resolve.map),
-        0
-    );
 
+    ret = replace_thing_group_root_mapping(
+        thing_group_name, components_to_resolve.map
+    );
     if (ret != GG_ERR_OK) {
-        GG_LOGE(
-            "Failed to write thing group to root components map to ggconfigd."
-        );
         return ret;
     }
 
@@ -1659,14 +2050,14 @@ static GgError resolve_dependencies(
     GgBuffer list_thing_groups_response
         = GG_BUF(list_thing_groups_response_buf);
 
+    GgObject cached_thing_groups;
     GgObject *thing_groups_list = NULL;
-    GgObject empty_list_obj = gg_obj_list(GG_LIST());
     uint8_t thing_groups_response_mem[100 * sizeof(GgObject)];
     GgArena thing_groups_json_alloc
         = gg_arena_init(GG_BUF(thing_groups_response_mem));
 
     // TODO: Retry infinitely for cloud deployment
-    ret = get_device_thing_groups(&list_thing_groups_response);
+    ret = resolve_get_device_thing_groups(&list_thing_groups_response);
     if (ret == GG_ERR_OK) {
         ret = parse_thing_groups_list(
             list_thing_groups_response,
@@ -1694,271 +2085,33 @@ static GgError resolve_dependencies(
         GG_LOGI(
             "Cloud call to list thing groups failed. Using previous thing groups list as deployment is local."
         );
-        ret = ggl_gg_config_read(
-            GG_BUF_LIST(
-                GG_STR("services"),
-                GG_STR("DeploymentService"),
-                GG_STR("lastThingGroupsListFromCloud")
-            ),
-            alloc,
-            thing_groups_list
-        );
+        ret = read_cached_thing_groups(alloc, &cached_thing_groups);
         if (ret != GG_ERR_OK) {
-            GG_LOGI(
-                "No info found in config for thing groups list, assuming no thing group memberships."
-            );
-            thing_groups_list = &empty_list_obj;
-        }
-    }
-
-    GG_LIST_FOREACH (thing_group_item, gg_obj_into_list(*thing_groups_list)) {
-        if (gg_obj_type(*thing_group_item) != GG_TYPE_MAP) {
-            GG_LOGE("Thing group item is not of type map.");
+            GG_LOGE("Failed to read cached thing groups list from config.");
             return ret;
         }
-
-        GgObject *thing_group_name_from_item_obj;
-
-        ret = gg_map_validate(
-            gg_obj_into_map(*thing_group_item),
-            GG_MAP_SCHEMA(
-                { GG_STR("thingGroupName"),
-                  GG_REQUIRED,
-                  GG_TYPE_BUF,
-                  &thing_group_name_from_item_obj },
-            )
-        );
-        if (ret != GG_ERR_OK) {
-            return ret;
-        }
-        GgBuffer thing_group_name_from_item
-            = gg_obj_into_buf(*thing_group_name_from_item_obj);
-
-        if (!gg_buffer_eq(thing_group_name_from_item, thing_group_name)) {
-            GgObject group_root_components_read_value;
-            ret = ggl_gg_config_read(
-                GG_BUF_LIST(
-                    GG_STR("services"),
-                    GG_STR("DeploymentService"),
-                    GG_STR("thingGroupsToRootComponents"),
-                    thing_group_name_from_item
-                ),
-                alloc,
-                &group_root_components_read_value
-            );
-            if (ret != GG_ERR_OK) {
-                GG_LOGI(
-                    "No info found in config for root components for thing group %.*s, assuming no components are part of this thing group.",
-                    (int) thing_group_name_from_item.len,
-                    thing_group_name_from_item.data
-                );
-            } else {
-                if (gg_obj_type(group_root_components_read_value)
-                    != GG_TYPE_MAP) {
-                    GG_LOGE(
-                        "Did not read a map from config for thing group to root components map"
-                    );
-                    return GG_ERR_INVALID;
-                }
-
-                GG_MAP_FOREACH (
-                    root_component_pair,
-                    gg_obj_into_map(group_root_components_read_value)
-                ) {
-                    GgBuffer root_component_val
-                        = gg_obj_into_buf(*gg_kv_val(root_component_pair));
-
-                    // If component is already in the root component list, it
-                    // must be the same version as the one already in the list
-                    // or we have a conflict.
-                    GgObject *existing_root_component_version_obj;
-                    ret = gg_map_validate(
-                        components_to_resolve.map,
-                        GG_MAP_SCHEMA(
-                            { gg_kv_key(*root_component_pair),
-                              GG_OPTIONAL,
-                              GG_TYPE_BUF,
-                              &existing_root_component_version_obj },
-                        )
-                    );
-                    if (ret != GG_ERR_OK) {
-                        return ret;
-                    }
-
-                    bool need_to_add_root_component = true;
-
-                    if (existing_root_component_version_obj != NULL) {
-                        GgBuffer existing_root_component_version
-                            = gg_obj_into_buf(
-                                *existing_root_component_version_obj
-                            );
-                        if (gg_buffer_eq(
-                                existing_root_component_version,
-                                gg_obj_into_buf(*gg_kv_val(root_component_pair))
-                            )) {
-                            need_to_add_root_component = false;
-                        } else {
-                            GG_LOGE(
-                                "There is a version conflict for component %.*s, where two deployments are asking for versions %.*s and %.*s. Please check that this root component does not have conflicting versions across your deployments.",
-                                (int) gg_kv_key(*root_component_pair).len,
-                                gg_kv_key(*root_component_pair).data,
-                                (int) root_component_val.len,
-                                root_component_val.data,
-                                (int) existing_root_component_version.len,
-                                existing_root_component_version.data
-                            );
-                            return GG_ERR_INVALID;
-                        }
-                    }
-
-                    if (need_to_add_root_component) {
-                        GgBuffer root_component_name_buf
-                            = gg_kv_key(*root_component_pair);
-                        ret = gg_arena_claim_buf(
-                            &root_component_name_buf, alloc
-                        );
-                        if (ret != GG_ERR_OK) {
-                            return ret;
-                        }
-
-                        GgBuffer root_component_version_buf
-                            = root_component_val;
-                        ret = gg_arena_claim_buf(
-                            &root_component_version_buf,
-                            &version_requirements_alloc
-                        );
-                        if (ret != GG_ERR_OK) {
-                            return ret;
-                        }
-
-                        ret = gg_kv_vec_push(
-                            &components_to_resolve,
-                            gg_kv(
-                                root_component_name_buf,
-                                gg_obj_buf(root_component_version_buf)
-                            )
-                        );
-                        if (ret != GG_ERR_OK) {
-                            return ret;
-                        }
-
-                        GG_LOGD(
-                            "Added %.*s to the list of root components to resolve from the thing group %.*s",
-                            (int) root_component_name_buf.len,
-                            root_component_name_buf.data,
-                            (int) thing_group_name_from_item.len,
-                            thing_group_name_from_item.data
-                        );
-                    }
-                }
-            }
-        }
+        thing_groups_list = &cached_thing_groups;
     }
 
-    // Add local components to components to resolve, if the deployment is not
-    // targeting LOCAL_DEPLOYMENTS
-    if (!gg_buffer_eq(GG_STR("LOCAL_DEPLOYMENTS"), thing_group_name)) {
-        GgObject local_components_read_value;
-        ret = ggl_gg_config_read(
-            GG_BUF_LIST(
-                GG_STR("services"),
-                GG_STR("DeploymentService"),
-                GG_STR("thingGroupsToRootComponents"),
-                GG_STR("LOCAL_DEPLOYMENTS")
-            ),
-            alloc,
-            &local_components_read_value
-        );
-        if (ret != GG_ERR_OK) {
-            GG_LOGI(
-                "No local components found in config, proceeding deployment without needing to add local components."
-            );
-        } else {
-            if (gg_obj_type(local_components_read_value) != GG_TYPE_MAP) {
-                GG_LOGE(
-                    "Did not read a map from config while looking up local components."
-                );
-                return GG_ERR_INVALID;
-            }
+    ret = merge_thing_group_root_components(
+        gg_obj_into_list(*thing_groups_list),
+        thing_group_name,
+        &components_to_resolve,
+        alloc,
+        &version_requirements_alloc
+    );
+    if (ret != GG_ERR_OK) {
+        return ret;
+    }
 
-            GG_MAP_FOREACH (
-                root_component_pair,
-                gg_obj_into_map(local_components_read_value)
-            ) {
-                GgBuffer root_component_val
-                    = gg_obj_into_buf(*gg_kv_val(root_component_pair));
-
-                // If component is already in the root component list, it
-                // must be the same version as the one already in the list
-                // or we have a conflict.
-                GgObject *existing_root_component_version_obj;
-                ret = gg_map_validate(
-                    components_to_resolve.map,
-                    GG_MAP_SCHEMA(
-                        { gg_kv_key(*root_component_pair),
-                          GG_OPTIONAL,
-                          GG_TYPE_BUF,
-                          &existing_root_component_version_obj },
-                    )
-                );
-                if (ret != GG_ERR_OK) {
-                    return ret;
-                }
-
-                bool need_to_add_root_component = true;
-
-                if (existing_root_component_version_obj != NULL) {
-                    GgBuffer existing_root_component_version
-                        = gg_obj_into_buf(*existing_root_component_version_obj);
-                    if (gg_buffer_eq(
-                            existing_root_component_version, root_component_val
-                        )) {
-                        need_to_add_root_component = false;
-                    } else {
-                        GG_LOGE(
-                            "There is a version conflict for component %.*s, where it is already locally deployed as version %.*s and the deployment requests version %.*s.",
-                            (int) gg_kv_key(*root_component_pair).len,
-                            gg_kv_key(*root_component_pair).data,
-                            (int) root_component_val.len,
-                            root_component_val.data,
-                            (int) existing_root_component_version.len,
-                            existing_root_component_version.data
-                        );
-                        return GG_ERR_INVALID;
-                    }
-                }
-
-                if (need_to_add_root_component) {
-                    GgBuffer root_component_name_buf
-                        = gg_kv_key(*root_component_pair);
-                    ret = gg_arena_claim_buf(&root_component_name_buf, alloc);
-                    if (ret != GG_ERR_OK) {
-                        return ret;
-                    }
-
-                    GgBuffer root_component_version_buf = root_component_val;
-                    ret = gg_arena_claim_buf(
-                        &root_component_version_buf, &version_requirements_alloc
-                    );
-                    if (ret != GG_ERR_OK) {
-                        return ret;
-                    }
-
-                    ret = gg_kv_vec_push(
-                        &components_to_resolve,
-                        gg_kv(
-                            root_component_name_buf,
-                            gg_obj_buf(root_component_version_buf)
-                        )
-                    );
-                    GG_LOGD(
-                        "Added %.*s to the list of root components to resolve as it has been previously locally deployed.",
-                        (int) root_component_name_buf.len,
-                        root_component_name_buf.data
-                    );
-                }
-            }
-        }
+    ret = merge_local_root_components(
+        thing_group_name,
+        &components_to_resolve,
+        alloc,
+        &version_requirements_alloc
+    );
+    if (ret != GG_ERR_OK) {
+        return ret;
     }
 
     GG_MAP_FOREACH (pair, components_to_resolve.map) {
@@ -1968,70 +2121,15 @@ static GgError resolve_dependencies(
         // it in this map.
         uint8_t resolved_version_arr[NAME_MAX];
         GgBuffer resolved_version = GG_BUF(resolved_version_arr);
-        bool found_local_candidate = resolve_component_version(
-            gg_kv_key(*pair), pair_val, &resolved_version
-        );
-
-        if (!found_local_candidate) {
-            // Resolve with cloud and download recipe
-            static uint8_t resolve_component_candidates_response_buf[16384]
-                = { 0 };
-            GgBuffer resolve_component_candidates_response
-                = GG_BUF(resolve_component_candidates_response_buf);
-
-            ret = resolve_component_with_cloud(
-                gg_kv_key(*pair),
-                pair_val,
-                &resolve_component_candidates_response
-            );
-            if (ret != GG_ERR_OK) {
-                return ret;
-            }
-
-            bool is_empty_response = gg_buffer_eq(
-                resolve_component_candidates_response, GG_STR("{}")
-            );
-
-            if (is_empty_response) {
-                GG_LOGI(
-                    "Cloud version resolution failed for component %.*s.",
-                    (int) gg_kv_key(*pair).len,
-                    pair_val.data
-                );
-                return GG_ERR_FAILURE;
-            }
-
-            ret = parse_dataplane_response_and_save_recipe(
-                resolve_component_candidates_response, args, &resolved_version
-            );
-            if (ret != GG_ERR_OK) {
-                return ret;
-            }
-        }
-
-        if (!is_valid_semver(resolved_version)) {
-            GG_LOGE(
-                "Resolved version for component %.*s is not a valid semantic "
-                "version.",
-                (int) gg_kv_key(*pair).len,
-                gg_kv_key(*pair).data
-            );
-            return GG_ERR_INVALID;
-        }
-
-        // Add resolved component to list of resolved components
-        ret = gg_arena_claim_buf(&resolved_version, alloc);
-        if (ret != GG_ERR_OK) {
-            return ret;
-        }
-
-        ret = gg_kv_vec_push(
+        ret = resolve_single_component_version(
+            gg_kv_key(*pair),
+            pair_val,
+            args,
+            alloc,
             resolved_components_kv_vec,
-            gg_kv(gg_kv_key(*pair), gg_obj_buf(resolved_version))
+            &resolved_version
         );
         if (ret != GG_ERR_OK) {
-            GG_LOGE("Error while adding component to list of resolved component"
-            );
             return ret;
         }
 
@@ -2285,6 +2383,57 @@ static GgBuffer get_unversioned_substring(GgBuffer arn) {
     return gg_buffer_substr(arn, 0, colon_index);
 }
 
+// Reads a component's persisted configArn list through the typed config reader
+// and validates that the top-level value is a list and every member is a
+// buffer. On success sets *present and publishes @p arn_list_obj. A missing
+// entry sets *present = false and returns GG_ERR_OK. Malformed persisted data
+// (a non-list top level or a non-buffer member) returns GG_ERR_INVALID without
+// publishing output; any other read failure is mapped to GG_ERR_FAILURE,
+// preserving the previous mapping of unrelated config-read failures.
+static GgError read_config_arn_list(
+    GgBuffer component_name,
+    GgArena *alloc,
+    GgObject *arn_list_obj,
+    bool *present
+) {
+    // Read into a local candidate so the caller-provided output is published
+    // only after the top-level type and every member have been validated. On
+    // any error path *arn_list_obj and *present are left unchanged.
+    GgObject candidate;
+    GgError ret = ggl_deployment_config_read_object(
+        GG_BUF_LIST(GG_STR("services"), component_name, GG_STR("configArn")),
+        alloc,
+        GG_TYPE_LIST,
+        &candidate
+    );
+    if (ret == GG_ERR_NOENTRY) {
+        *present = false;
+        return GG_ERR_OK;
+    }
+    if (ret == GG_ERR_CONFIG) {
+        // Present but not a list.
+        GG_LOGE("Configuration arn list not of expected type.");
+        return GG_ERR_INVALID;
+    }
+    if (ret != GG_ERR_OK) {
+        GG_LOGE("Failed to retrieve configArn.");
+        return GG_ERR_FAILURE;
+    }
+
+    GgList arn_list = gg_obj_into_list(candidate);
+    GG_LIST_FOREACH (arn, arn_list) {
+        if (gg_obj_type(*arn) != GG_TYPE_BUF) {
+            GG_LOGE("Configuration arn not of type buffer.");
+            return GG_ERR_INVALID;
+        }
+    }
+
+    // Publish output only after the top-level type and every member validate.
+    *arn_list_obj = candidate;
+    *present = true;
+    return GG_ERR_OK;
+}
+
 static GgError add_arn_list_to_config(
     GgBuffer component_name, GgBuffer configuration_arn
 ) {
@@ -2309,28 +2458,22 @@ static GgError add_arn_list_to_config(
          + (sizeof(GgObject) * MAX_DEPLOYMENT_TARGETS)];
     GgArena arn_list_alloc = gg_arena_init(GG_BUF(arn_list_mem));
 
+    // Read and fully validate the persisted list first. Malformed persisted
+    // data returns here with no config write.
     GgObject arn_list_obj;
-    GgError ret = ggl_gg_config_read(
-        GG_BUF_LIST(GG_STR("services"), component_name, GG_STR("configArn")),
-        &arn_list_alloc,
-        &arn_list_obj
+    bool arn_list_present = false;
+    GgError ret = read_config_arn_list(
+        component_name, &arn_list_alloc, &arn_list_obj, &arn_list_present
     );
-
-    if ((ret != GG_ERR_OK) && (ret != GG_ERR_NOENTRY)) {
-        GG_LOGE("Failed to retrieve configArn.");
-        return GG_ERR_FAILURE;
+    if (ret != GG_ERR_OK) {
+        return ret;
     }
 
     GgObjVec new_arn_list
         = GG_OBJ_VEC((GgObject[MAX_DEPLOYMENT_TARGETS]) { 0 });
-    if (ret != GG_ERR_NOENTRY) {
+    if (arn_list_present) {
         // list exists in config, parse for current config arn and append if it
         // is not already included
-        if (gg_obj_type(arn_list_obj) != GG_TYPE_LIST) {
-            GG_LOGE("Configuration arn list not of expected type.");
-            return GG_ERR_INVALID;
-        }
-
         GgList arn_list = gg_obj_into_list(arn_list_obj);
         if (arn_list.len >= MAX_DEPLOYMENT_TARGETS) {
             GG_LOGE(
@@ -2341,10 +2484,7 @@ static GgError add_arn_list_to_config(
             return GG_ERR_FAILURE;
         }
         GG_LIST_FOREACH (arn, arn_list) {
-            if (gg_obj_type(*arn) != GG_TYPE_BUF) {
-                GG_LOGE("Configuration arn not of type buffer.");
-                return ret;
-            }
+            // Every member was validated as a buffer by read_config_arn_list.
             if (gg_buffer_eq(
                     get_unversioned_substring(gg_obj_into_buf(*arn)),
                     get_unversioned_substring(configuration_arn)
@@ -2354,7 +2494,7 @@ static GgError add_arn_list_to_config(
                     "Configuration arn already exists for this thing group, overwriting it."
                 );
                 *arn = gg_obj_buf(configuration_arn);
-                ret = ggl_gg_config_write(
+                ret = configarn_config_write(
                     GG_BUF_LIST(
                         GG_STR("services"), component_name, GG_STR("configArn")
                     ),
@@ -2377,7 +2517,7 @@ static GgError add_arn_list_to_config(
     ret = gg_obj_vec_push(&new_arn_list, gg_obj_buf(configuration_arn));
     assert(ret == GG_ERR_OK);
 
-    ret = ggl_gg_config_write(
+    ret = configarn_config_write(
         GG_BUF_LIST(GG_STR("services"), component_name, GG_STR("configArn")),
         gg_obj_list(new_arn_list.list),
         &(int64_t) { 3 }
@@ -3018,6 +3158,201 @@ static GgError validate_endpoint_switch_deployment(
     return GG_ERR_OK;
 }
 
+#ifdef GG_SDK_TESTING
+
+static GgError (*orchestrate_process_bootstrap)(
+    GgMap components,
+    GgBuffer root_path,
+    GgBufVec *bootstrap_components,
+    GglDeployment *deployment
+) = process_bootstrap_phase;
+static GgError (*orchestrate_wait_for_phase)(
+    GgBufVec components, GgBuffer phase
+) = wait_for_phase_status;
+
+#else
+
+// NOLINTBEGIN(readability-identifier-naming)
+#define orchestrate_process_bootstrap process_bootstrap_phase
+#define orchestrate_wait_for_phase wait_for_phase_status
+// NOLINTEND(readability-identifier-naming)
+
+#endif
+
+static GgError orchestrate_bootstrap_lifecycle(
+    GgMap components, GgBuffer root_path, GglDeployment *deployment
+) {
+    static GgBuffer component_names[MAX_COMP_NAME_BUF_SIZE];
+    GgBufVec names = GG_BUF_VEC(component_names);
+    GgError ret = orchestrate_process_bootstrap(
+        components, root_path, &names, deployment
+    );
+    if (ret != GG_ERR_OK) {
+        return ret;
+    }
+    return orchestrate_wait_for_phase(names, GG_STR("bootstrap"));
+}
+
+typedef enum {
+    COMPONENT_NEEDS_DEPLOYMENT,
+    COMPONENT_ALREADY_RUNNING,
+} ComponentLifecycleClassification;
+
+#ifdef GG_SDK_TESTING
+
+static GgError (*retrieve_component_status)(
+    GgBuffer component_name, GgArena *alloc, GgBuffer *component_status
+) = ggl_gghealthd_retrieve_component_status;
+
+void deployment_handler_reset_test_seams(void);
+void deployment_handler_override_test_seam_for_reset_test(void);
+bool deployment_handler_test_seams_are_reset(void);
+bool deployment_handler_configarn_test_seam_is_reset(void);
+
+static GgError deployment_handler_reset_test_override(
+    GgBuffer component_name, GgArena *alloc, GgBuffer *component_status
+) {
+    (void) component_name;
+    (void) alloc;
+    (void) component_status;
+    return GG_ERR_FAILURE;
+}
+
+static GgError deployment_handler_reset_test_configarn_override(
+    GgBufList key_path, GgObject value, const int64_t *timestamp
+) {
+    (void) key_path;
+    (void) value;
+    (void) timestamp;
+    return GG_ERR_FAILURE;
+}
+
+void deployment_handler_reset_test_seams(void) {
+    dataplane_config_write = ggl_gg_config_write;
+    thing_groups_config_write = ggl_gg_config_write;
+    configarn_config_write = ggl_gg_config_write;
+    resolve_get_device_thing_groups = get_device_thing_groups;
+    resolve_config_read = ggl_gg_config_read;
+    resolve_config_delete = ggl_gg_config_delete;
+    resolve_config_write = ggl_gg_config_write;
+    resolve_local_component = resolve_component_version;
+    resolve_cloud_component = resolve_component_with_cloud;
+    parse_cloud_component = parse_dataplane_response_and_save_recipe;
+    cloud_resolution_failure_logger = log_cloud_resolution_failure;
+    orchestrate_process_bootstrap = process_bootstrap_phase;
+    orchestrate_wait_for_phase = wait_for_phase_status;
+    retrieve_component_status = ggl_gghealthd_retrieve_component_status;
+}
+
+void deployment_handler_override_test_seam_for_reset_test(void) {
+    configarn_config_write = deployment_handler_reset_test_configarn_override;
+    retrieve_component_status = deployment_handler_reset_test_override;
+}
+
+bool deployment_handler_configarn_test_seam_is_reset(void) {
+    return configarn_config_write == ggl_gg_config_write;
+}
+
+bool deployment_handler_test_seams_are_reset(void) {
+    return (dataplane_config_write == ggl_gg_config_write)
+        && (thing_groups_config_write == ggl_gg_config_write)
+        && deployment_handler_configarn_test_seam_is_reset()
+        && (resolve_get_device_thing_groups == get_device_thing_groups)
+        && (resolve_config_read == ggl_gg_config_read)
+        && (resolve_config_delete == ggl_gg_config_delete)
+        && (resolve_config_write == ggl_gg_config_write)
+        && (resolve_local_component == resolve_component_version)
+        && (resolve_cloud_component == resolve_component_with_cloud)
+        && (parse_cloud_component == parse_dataplane_response_and_save_recipe)
+        && (cloud_resolution_failure_logger == log_cloud_resolution_failure)
+        && (orchestrate_process_bootstrap == process_bootstrap_phase)
+        && (orchestrate_wait_for_phase == wait_for_phase_status)
+        && (retrieve_component_status == ggl_gghealthd_retrieve_component_status
+        );
+}
+
+#else
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+#define retrieve_component_status ggl_gghealthd_retrieve_component_status
+
+#endif
+
+static GgError classify_existing_component(
+    GgBuffer component_name, ComponentLifecycleClassification *classification
+) {
+    GgArena status_alloc = gg_arena_init(GG_BUF((uint8_t[NAME_MAX]) { 0 }));
+    GgBuffer status = { 0 };
+    GgError ret
+        = retrieve_component_status(component_name, &status_alloc, &status);
+    if (ret != GG_ERR_OK) {
+        *classification = COMPONENT_NEEDS_DEPLOYMENT;
+        return GG_ERR_OK;
+    }
+
+    if (gg_buffer_eq(status, GG_STR("RUNNING"))
+        || gg_buffer_eq(status, GG_STR("FINISHED"))) {
+        *classification = COMPONENT_ALREADY_RUNNING;
+    } else {
+        *classification = COMPONENT_NEEDS_DEPLOYMENT;
+    }
+    return GG_ERR_OK;
+}
+
+static GgError enqueue_component_for_deployment(
+    GgKVVec *components_to_deploy, GgBuffer name, GgObject version
+) {
+    GgError ret = gg_kv_vec_push(components_to_deploy, gg_kv(name, version));
+    if (ret != GG_ERR_OK) {
+        GG_LOGE(
+            "Failed to add component info for %.*s to deployment vector.",
+            (int) name.len,
+            name.data
+        );
+        return ret;
+    }
+    GG_LOGD(
+        "Added %.*s to list of components that need to be processed.",
+        (int) name.len,
+        name.data
+    );
+    return GG_ERR_OK;
+}
+
+static GgError select_component_for_deployment(
+    GgBuffer name,
+    GgObject version,
+    bool component_updated,
+    bool config_updated,
+    GgKVVec *components_to_deploy
+) {
+    if (component_updated || config_updated) {
+        return enqueue_component_for_deployment(
+            components_to_deploy, name, version
+        );
+    }
+
+    ComponentLifecycleClassification classification;
+    GgError ret = classify_existing_component(name, &classification);
+    if (ret != GG_ERR_OK) {
+        return ret;
+    }
+    if (classification == COMPONENT_NEEDS_DEPLOYMENT) {
+        return enqueue_component_for_deployment(
+            components_to_deploy, name, version
+        );
+    }
+
+    GG_LOGD(
+        "Component %.*s is already running. Will not redeploy.",
+        (int) name.len,
+        name.data
+    );
+    return save_component_info(
+        name, gg_obj_into_buf(version), GG_STR("completed")
+    );
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void handle_deployment(
     GglDeployment *deployment,
@@ -3617,117 +3952,23 @@ static void handle_deployment(
             return;
         }
 
-        if (component_updated
-            || is_component_config_updated(deployment, gg_kv_key(*pair))) {
-            ret = gg_kv_vec_push(
-                &components_to_deploy, gg_kv(gg_kv_key(*pair), *gg_kv_val(pair))
-            );
-            if (ret != GG_ERR_OK) {
-                GG_LOGE(
-                    "Failed to add component info for %.*s to deployment vector.",
-                    (int) gg_kv_key(*pair).len,
-                    gg_kv_key(*pair).data
-                );
-                return;
-            }
-            GG_LOGD(
-                "Added %.*s to list of components that need to be processed.",
-                (int) gg_kv_key(*pair).len,
-                gg_kv_key(*pair).data
-            );
-        } else {
-            // component already exists, check its lifecycle state
-            GgArena component_status_alloc
-                = gg_arena_init(GG_BUF((uint8_t[NAME_MAX]) { 0 }));
-            GgBuffer component_status;
-            ret = ggl_gghealthd_retrieve_component_status(
-                gg_kv_key(*pair), &component_status_alloc, &component_status
-            );
-
-            if (ret != GG_ERR_OK) {
-                GG_LOGD(
-                    "Failed to retrieve health status for %.*s. Redeploying component.",
-                    (int) gg_kv_key(*pair).len,
-                    gg_kv_key(*pair).data
-                );
-                ret = gg_kv_vec_push(
-                    &components_to_deploy,
-                    gg_kv(gg_kv_key(*pair), *gg_kv_val(pair))
-                );
-                if (ret != GG_ERR_OK) {
-                    GG_LOGE(
-                        "Failed to add component info for %.*s to deployment vector.",
-                        (int) gg_kv_key(*pair).len,
-                        gg_kv_key(*pair).data
-                    );
-                    return;
-                }
-                GG_LOGD(
-                    "Added %.*s to list of components that need to be processed.",
-                    (int) gg_kv_key(*pair).len,
-                    gg_kv_key(*pair).data
-                );
-            }
-
-            // Skip redeploying components in a RUNNING state
-            if (gg_buffer_eq(component_status, GG_STR("RUNNING"))
-                || gg_buffer_eq(component_status, GG_STR("FINISHED"))) {
-                GG_LOGD(
-                    "Component %.*s is already running. Will not redeploy.",
-                    (int) gg_kv_key(*pair).len,
-                    gg_kv_key(*pair).data
-                );
-                // save as a deployed component in case of bootstrap
-                ret = save_component_info(
-                    gg_kv_key(*pair), pair_val, GG_STR("completed")
-                );
-                if (ret != GG_ERR_OK) {
-                    return;
-                }
-            } else {
-                ret = gg_kv_vec_push(
-                    &components_to_deploy,
-                    gg_kv(gg_kv_key(*pair), *gg_kv_val(pair))
-                );
-                if (ret != GG_ERR_OK) {
-                    GG_LOGE(
-                        "Failed to add component info for %.*s to deployment vector.",
-                        (int) gg_kv_key(*pair).len,
-                        gg_kv_key(*pair).data
-                    );
-                    return;
-                }
-                GG_LOGD(
-                    "Added %.*s to list of components that need to be processed.",
-                    (int) gg_kv_key(*pair).len,
-                    gg_kv_key(*pair).data
-                );
-            }
+        ret = select_component_for_deployment(
+            gg_kv_key(*pair),
+            *gg_kv_val(pair),
+            component_updated,
+            is_component_config_updated(deployment, gg_kv_key(*pair)),
+            &components_to_deploy
+        );
+        if (ret != GG_ERR_OK) {
+            return;
         }
     }
 
     // TODO: Add a logic to only run the phases that exist with the latest
     // deployment
     if (components_to_deploy.map.len != 0) {
-        // collect all component names that have relevant bootstrap service
-        // files
-        static GgBuffer bootstrap_comp_name_buf[MAX_COMP_NAME_BUF_SIZE];
-        GgBufVec bootstrap_comp_name_buf_vec
-            = GG_BUF_VEC(bootstrap_comp_name_buf);
-
-        ret = process_bootstrap_phase(
-            components_to_deploy.map,
-            args->root_path,
-            &bootstrap_comp_name_buf_vec,
-            deployment
-        );
-        if (ret != GG_ERR_OK) {
-            return;
-        }
-
-        // wait for all the bootstrap status
-        ret = wait_for_phase_status(
-            bootstrap_comp_name_buf_vec, GG_STR("bootstrap")
+        ret = orchestrate_bootstrap_lifecycle(
+            components_to_deploy.map, args->root_path, deployment
         );
         if (ret != GG_ERR_OK) {
             return;
@@ -4095,28 +4336,11 @@ static void handle_deployment(
     // covered by the component-install loop above. This allows updating
     // config for already-installed components (e.g., NucleusLite) without
     // re-deploying them.
-    if (deployment->component_to_configuration.len > 0) {
-        GG_MAP_FOREACH (cfg_pair, deployment->component_to_configuration) {
-            // Skip components already processed in the first pass.
-            GgObject *already_handled;
-            if (gg_map_get(
-                    resolved_components_kv_vec.map,
-                    gg_kv_key(*cfg_pair),
-                    &already_handled
-                )) {
-                continue;
-            }
-            GgError cfg_ret = apply_component_to_configuration(
-                gg_kv_key(*cfg_pair), deployment->component_to_configuration
-            );
-            if (cfg_ret != GG_ERR_OK) {
-                GG_LOGE(
-                    "Failed to apply component_to_configuration for %.*s.",
-                    (int) gg_kv_key(*cfg_pair).len,
-                    gg_kv_key(*cfg_pair).data
-                );
-            }
-        }
+    ret = apply_remaining_component_configurations(
+        deployment->component_to_configuration, resolved_components_kv_vec.map
+    );
+    if (ret != GG_ERR_OK) {
+        return;
     }
 
     *deployment_succeeded = true;
@@ -4146,6 +4370,8 @@ static void rollback_config(GgBuffer deployment_id) {
 }
 
 static GgError ggl_deployment_listen(GglDeploymentHandlerThreadArgs *args) {
+    ggl_iot_jobs_wait_for_listener_ready();
+
     // check for in progress deployment in case of bootstrap
     GglDeployment bootstrap_deployment = { 0 };
     uint8_t jobs_id_resp_mem[64] = { 0 };
@@ -4170,6 +4396,7 @@ static GgError ggl_deployment_listen(GglDeploymentHandlerThreadArgs *args) {
     );
     if (ret != GG_ERR_OK) {
         GG_LOGD("No deployments previously in progress detected.");
+        ggl_iot_jobs_bootstrap_scan_complete();
     } else {
         GG_LOGI(
             "Found previously in progress deployment %.*s. Resuming deployment.",
@@ -4182,6 +4409,7 @@ static GgError ggl_deployment_listen(GglDeploymentHandlerThreadArgs *args) {
                == set_jobs_deployment_for_bootstrap(
                    jobs_id, bootstrap_deployment.deployment_id
                ));
+        ggl_iot_jobs_bootstrap_scan_complete();
 
         bool bootstrap_deployment_succeeded = false;
 
@@ -4230,15 +4458,13 @@ static GgError ggl_deployment_listen(GglDeploymentHandlerThreadArgs *args) {
         if (ret != GG_ERR_OK) {
             GG_LOGE("Failed to delete saved deployment info from config.");
         }
-
-        // TODO: investigate deployment queue behavior with bootstrap deployment
-        ggl_deployment_release(&bootstrap_deployment);
     }
 
     while (true) {
         GglDeployment *deployment;
+        GglDeploymentQueueToken token = { 0 };
         // Since this is blocking, error is fatal
-        ret = ggl_deployment_dequeue(&deployment);
+        ret = ggl_deployment_dequeue(&deployment, &token);
         if (ret != GG_ERR_OK) {
             return ret;
         }
@@ -4298,7 +4524,10 @@ static GgError ggl_deployment_listen(GglDeploymentHandlerThreadArgs *args) {
             GG_LOGE("Failed to delete saved deployment info from config.");
         }
 
-        ggl_deployment_release(deployment);
+        ret = ggl_deployment_release(&token);
+        if (ret != GG_ERR_OK) {
+            return ret;
+        }
     }
 }
 
@@ -4322,3 +4551,1374 @@ void *ggl_deployment_handler_thread(void *ctx) {
 
     return NULL;
 }
+
+#ifdef GG_SDK_TESTING
+
+#include <gg/test.h>
+#include <sys/stat.h>
+#include <unity.h>
+
+static GgError handler_config_read_error;
+static GgObject handler_config_read_value;
+
+static GgError handler_fake_config_reader(
+    GgBufList key_path, GgArena *alloc, GgObject *result
+) {
+    (void) key_path;
+    (void) alloc;
+    if (handler_config_read_error != GG_ERR_OK) {
+        return handler_config_read_error;
+    }
+    *result = handler_config_read_value;
+    return GG_ERR_OK;
+}
+
+static void handler_use_config_value(GgObject value) {
+    handler_config_read_error = GG_ERR_OK;
+    handler_config_read_value = value;
+    ggl_deployment_config_set_reader_for_test(handler_fake_config_reader);
+}
+
+static GgError handler_fake_cloud_thing_groups(GgBuffer *response) {
+    (void) response;
+    return GG_ERR_NOCONN;
+}
+
+static GgBuffer handler_cloud_thing_groups_response;
+
+static GgError handler_fake_cloud_thing_groups_response(GgBuffer *response) {
+    *response = handler_cloud_thing_groups_response;
+    return GG_ERR_OK;
+}
+
+static size_t handler_dataplane_config_write_calls;
+static bool handler_dataplane_config_write_matches;
+
+static GgError handler_fake_dataplane_config_write(
+    GgBufList key_path, GgObject value, const int64_t *timestamp
+) {
+    handler_dataplane_config_write_calls++;
+    GgObject *arn_obj = NULL;
+    handler_dataplane_config_write_matches = (key_path.len == 2)
+        && gg_buffer_eq(key_path.bufs[0], GG_STR("services"))
+        && gg_buffer_eq(key_path.bufs[1], GG_STR("Test.Component"))
+        && (gg_obj_type(value) == GG_TYPE_MAP)
+        && gg_map_get(gg_obj_into_map(value), GG_STR("arn"), &arn_obj)
+        && (gg_obj_type(*arn_obj) == GG_TYPE_BUF)
+        && gg_buffer_eq(gg_obj_into_buf(*arn_obj), GG_STR("test-arn"))
+        && (timestamp != NULL) && (*timestamp == 1);
+    return GG_ERR_OK;
+}
+
+static size_t handler_thing_groups_config_write_calls;
+
+static GgError handler_fake_thing_groups_config_write(
+    GgBufList key_path, GgObject value, const int64_t *timestamp
+) {
+    (void) key_path;
+    (void) value;
+    (void) timestamp;
+    handler_thing_groups_config_write_calls++;
+    return GG_ERR_OK;
+}
+
+static GgError handler_fake_config_delete(GgBufList key_path) {
+    (void) key_path;
+    return GG_ERR_OK;
+}
+
+static GgError handler_fake_config_write(
+    GgBufList key_path, GgObject value, const int64_t *timestamp
+) {
+    (void) key_path;
+    (void) value;
+    (void) timestamp;
+    return GG_ERR_OK;
+}
+
+static GgError handler_resolve_read_error;
+static GgObject handler_resolve_read_value;
+static size_t handler_resolve_delete_calls;
+static size_t handler_resolve_write_calls;
+static GgError handler_first_resolve_write_error;
+static GgError handler_second_resolve_write_error;
+static GgObject handler_last_resolve_write_value;
+
+static GgError handler_fake_resolve_config_read(
+    GgBufList key_path, GgArena *alloc, GgObject *result
+) {
+    (void) key_path;
+    (void) alloc;
+    if (handler_resolve_read_error != GG_ERR_OK) {
+        return handler_resolve_read_error;
+    }
+    *result = handler_resolve_read_value;
+    return GG_ERR_OK;
+}
+
+static GgError handler_fake_cloning_resolve_config_read(
+    GgBufList key_path, GgArena *alloc, GgObject *result
+) {
+    (void) key_path;
+    if (handler_resolve_read_error != GG_ERR_OK) {
+        return handler_resolve_read_error;
+    }
+    *result = handler_resolve_read_value;
+    return gg_arena_claim_obj(result, alloc);
+}
+
+static GgError handler_fake_resolve_config_delete(GgBufList key_path) {
+    (void) key_path;
+    handler_resolve_delete_calls++;
+    return GG_ERR_OK;
+}
+
+static GgError handler_fake_transactional_config_write(
+    GgBufList key_path, GgObject value, const int64_t *timestamp
+) {
+    (void) key_path;
+    (void) timestamp;
+    handler_resolve_write_calls++;
+    handler_last_resolve_write_value = value;
+    if (handler_resolve_write_calls == 1) {
+        return handler_first_resolve_write_error;
+    }
+    if (handler_resolve_write_calls == 2) {
+        return handler_second_resolve_write_error;
+    }
+    return GG_ERR_OK;
+}
+
+static bool handler_fake_local_candidate_missing(
+    GgBuffer component_name,
+    GgBuffer version_requirement,
+    GgBuffer *resolved_version
+) {
+    (void) component_name;
+    (void) version_requirement;
+    (void) resolved_version;
+    return false;
+}
+
+static bool handler_fake_local_candidate_found(
+    GgBuffer component_name,
+    GgBuffer version_requirement,
+    GgBuffer *resolved_version
+) {
+    (void) component_name;
+    (void) version_requirement;
+    memcpy(resolved_version->data, "1.2.3", 5);
+    resolved_version->len = 5;
+    return true;
+}
+
+static GgError handler_fake_empty_cloud_resolution(
+    GgBuffer component_name, GgBuffer version_requirement, GgBuffer *response
+) {
+    (void) component_name;
+    (void) version_requirement;
+    *response = GG_STR("{}");
+    return GG_ERR_OK;
+}
+
+static GgBuffer handler_logged_resolution_component;
+
+static void handler_fake_resolution_failure_logger(GgBuffer component_name) {
+    handler_logged_resolution_component = component_name;
+}
+
+static GgError handler_health_error;
+static GgBuffer handler_health_status;
+
+static GgError handler_fake_component_status(
+    GgBuffer component_name, GgArena *alloc, GgBuffer *component_status
+) {
+    (void) component_name;
+    (void) alloc;
+    if (handler_health_error != GG_ERR_OK) {
+        return handler_health_error;
+    }
+    *component_status = handler_health_status;
+    return GG_ERR_OK;
+}
+
+static GgError handler_bootstrap_result;
+static GgError handler_wait_result;
+static size_t handler_lifecycle_call_order;
+static size_t handler_bootstrap_call_order;
+static size_t handler_wait_call_order;
+
+static GgError handler_fake_process_bootstrap(
+    GgMap components,
+    GgBuffer root_path,
+    GgBufVec *bootstrap_components,
+    GglDeployment *deployment
+) {
+    (void) components;
+    (void) root_path;
+    (void) bootstrap_components;
+    (void) deployment;
+    handler_bootstrap_call_order = ++handler_lifecycle_call_order;
+    return handler_bootstrap_result;
+}
+
+static GgError handler_fake_wait_for_phase(
+    GgBufVec components, GgBuffer phase
+) {
+    (void) components;
+    TEST_ASSERT_TRUE(gg_buffer_eq(phase, GG_STR("bootstrap")));
+    handler_wait_call_order = ++handler_lifecycle_call_order;
+    return handler_wait_result;
+}
+
+static GgError handler_resolve_with_cached_thing_groups(void) {
+    resolve_get_device_thing_groups = handler_fake_cloud_thing_groups;
+    handler_resolve_read_error = GG_ERR_NOENTRY;
+    resolve_config_read = handler_fake_resolve_config_read;
+    resolve_config_delete = handler_fake_config_delete;
+    resolve_config_write = handler_fake_config_write;
+
+    GgArena alloc = gg_arena_init(GG_BUF((uint8_t[512]) { 0 }));
+    GgKVVec resolved_components = GG_KV_VEC((GgKV[4]) { 0 });
+    bool depends_on_token_exchange_service = true;
+    GgError ret = resolve_dependencies(
+        (GgMap) { 0 },
+        GG_STR("LOCAL_DEPLOYMENTS"),
+        LOCAL_DEPLOYMENT,
+        NULL,
+        &alloc,
+        &resolved_components,
+        &depends_on_token_exchange_service
+    );
+    return ret;
+}
+
+static GgError handler_resolve_with_cloud_thing_groups(GgBuffer response) {
+    handler_cloud_thing_groups_response = response;
+    handler_thing_groups_config_write_calls = 0;
+    resolve_get_device_thing_groups = handler_fake_cloud_thing_groups_response;
+    handler_resolve_read_error = GG_ERR_NOENTRY;
+    resolve_config_read = handler_fake_resolve_config_read;
+    resolve_config_delete = handler_fake_config_delete;
+    resolve_config_write = handler_fake_config_write;
+    thing_groups_config_write = handler_fake_thing_groups_config_write;
+
+    GgArena alloc = gg_arena_init(GG_BUF((uint8_t[512]) { 0 }));
+    GgKVVec resolved_components = GG_KV_VEC((GgKV[4]) { 0 });
+    bool depends_on_token_exchange_service = true;
+    return resolve_dependencies(
+        (GgMap) { 0 },
+        GG_STR("group"),
+        THING_GROUP_DEPLOYMENT,
+        NULL,
+        &alloc,
+        &resolved_components,
+        &depends_on_token_exchange_service
+    );
+}
+
+static void handler_create_recipe_test_root(char root_path[static PATH_MAX]) {
+    static const char template[] = "/tmp/ggdeploymentd-r07-XXXXXX";
+    memcpy(root_path, template, sizeof(template));
+    TEST_ASSERT_NOT_NULL(mkdtemp(root_path));
+}
+
+static void handler_build_recipe_test_path(
+    char path[static PATH_MAX], const char *root_path, const char *version
+) {
+    int written = snprintf(
+        path,
+        PATH_MAX,
+        "%s/packages/recipes/Test.Component-%s.json",
+        root_path,
+        version
+    );
+    TEST_ASSERT_GREATER_OR_EQUAL_INT(0, written);
+    TEST_ASSERT_LESS_THAN_INT(PATH_MAX, written);
+}
+
+static void handler_cleanup_recipe_test_root(
+    const char *root_path, const char *recipe_path
+) {
+    (void) unlink(recipe_path);
+
+    char path[PATH_MAX];
+    int written
+        = snprintf(path, sizeof(path), "%s/packages/recipes", root_path);
+    if ((written >= 0) && ((size_t) written < sizeof(path))) {
+        (void) rmdir(path);
+    }
+    written = snprintf(path, sizeof(path), "%s/packages", root_path);
+    if ((written >= 0) && ((size_t) written < sizeof(path))) {
+        (void) rmdir(path);
+    }
+    (void) rmdir(root_path);
+}
+
+GG_TEST_DEFINE(data_endpoint_long_to_short_reread) {
+    GgByteVec endpoint = GG_BYTE_VEC(config.data_endpoint);
+    handler_use_config_value(gg_obj_buf(GG_STR("long-data-endpoint")));
+    GG_TEST_ASSERT_OK(get_data_endpoint(&endpoint));
+    TEST_ASSERT_EQUAL_UINT8('\0', config.data_endpoint[18]);
+
+    endpoint = GG_BYTE_VEC(config.data_endpoint);
+    handler_use_config_value(gg_obj_buf(GG_STR("short")));
+    GG_TEST_ASSERT_OK(get_data_endpoint(&endpoint));
+    TEST_ASSERT_EQUAL_size_t(5, endpoint.buf.len);
+    TEST_ASSERT_EQUAL_UINT8('\0', config.data_endpoint[5]);
+    TEST_ASSERT_EQUAL_STRING("short", config.data_endpoint);
+}
+
+GG_TEST_DEFINE(data_port_long_to_short_reread) {
+    GgByteVec port = GG_BYTE_VEC(config.port);
+    handler_use_config_value(gg_obj_buf(GG_STR("8443")));
+    GG_TEST_ASSERT_OK(get_data_port(&port));
+    TEST_ASSERT_EQUAL_UINT8('\0', config.port[4]);
+
+    port = GG_BYTE_VEC(config.port);
+    handler_use_config_value(gg_obj_buf(GG_STR("443")));
+    GG_TEST_ASSERT_OK(get_data_port(&port));
+    TEST_ASSERT_EQUAL_size_t(3, port.buf.len);
+    TEST_ASSERT_EQUAL_UINT8('\0', config.port[3]);
+    TEST_ASSERT_EQUAL_STRING("443", config.port);
+}
+
+GG_TEST_DEFINE(cached_thing_groups_returns_validated_list) {
+    GgObject item = gg_obj_map(
+        GG_MAP(gg_kv(GG_STR("thingGroupName"), gg_obj_buf(GG_STR("group"))))
+    );
+    handler_use_config_value(gg_obj_list((GgList) { .items = &item, .len = 1 })
+    );
+    GgArena alloc = gg_arena_init(GG_BUF((uint8_t[64]) { 0 }));
+    GgObject result;
+
+    GG_TEST_ASSERT_OK(read_cached_thing_groups(&alloc, &result));
+    TEST_ASSERT_EQUAL_INT(GG_TYPE_LIST, gg_obj_type(result));
+    TEST_ASSERT_EQUAL_size_t(1, gg_obj_into_list(result).len);
+}
+
+GG_TEST_DEFINE(cached_thing_groups_defaults_only_on_noentry) {
+    GgArena alloc = gg_arena_init(GG_BUF((uint8_t[64]) { 0 }));
+    GgObject result = gg_obj_i64(9);
+
+    handler_config_read_error = GG_ERR_NOENTRY;
+    ggl_deployment_config_set_reader_for_test(handler_fake_config_reader);
+    GG_TEST_ASSERT_OK(read_cached_thing_groups(&alloc, &result));
+    TEST_ASSERT_EQUAL_INT(GG_TYPE_LIST, gg_obj_type(result));
+    TEST_ASSERT_EQUAL_size_t(0, gg_obj_into_list(result).len);
+
+    handler_config_read_error = GG_ERR_NOMEM;
+    result = gg_obj_i64(9);
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_NOMEM, read_cached_thing_groups(&alloc, &result)
+    );
+    TEST_ASSERT_EQUAL_INT64(9, gg_obj_into_i64(result));
+}
+
+GG_TEST_DEFINE(resolve_dependencies_uses_cached_thing_groups) {
+    GgObject item = gg_obj_map(GG_MAP(
+        gg_kv(GG_STR("thingGroupName"), gg_obj_buf(GG_STR("LOCAL_DEPLOYMENTS")))
+    ));
+    handler_use_config_value(gg_obj_list((GgList) { .items = &item, .len = 1 })
+    );
+
+    GG_TEST_ASSERT_OK(handler_resolve_with_cached_thing_groups());
+}
+
+GG_TEST_DEFINE(resolve_dependencies_treats_missing_cache_as_empty) {
+    handler_config_read_error = GG_ERR_NOENTRY;
+    ggl_deployment_config_set_reader_for_test(handler_fake_config_reader);
+
+    GG_TEST_ASSERT_OK(handler_resolve_with_cached_thing_groups());
+}
+
+GG_TEST_DEFINE(resolve_dependencies_propagates_cached_read_error) {
+    handler_config_read_error = GG_ERR_NOMEM;
+    ggl_deployment_config_set_reader_for_test(handler_fake_config_reader);
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_NOMEM, handler_resolve_with_cached_thing_groups()
+    );
+}
+
+GG_TEST_DEFINE(resolve_dependencies_propagates_cached_type_error) {
+    handler_use_config_value(gg_obj_buf(GG_STR("not-a-list")));
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_CONFIG, handler_resolve_with_cached_thing_groups()
+    );
+}
+
+GG_TEST_DEFINE(artifact_permission_mode_malformed_read) {
+    static GgKV permission_pair;
+    permission_pair = gg_kv(GG_STR("Read"), gg_obj_i64(1));
+    GgObject permission
+        = gg_obj_map((GgMap) { .pairs = &permission_pair, .len = 1 });
+    mode_t mode = 0;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_PARSE, get_artifact_permission_mode(&permission, &mode)
+    );
+}
+
+GG_TEST_DEFINE(artifact_permission_mode_malformed_execute) {
+    static GgKV permission_pair;
+    permission_pair = gg_kv(GG_STR("Execute"), gg_obj_i64(1));
+    GgObject permission
+        = gg_obj_map((GgMap) { .pairs = &permission_pair, .len = 1 });
+    mode_t mode = 0;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_PARSE, get_artifact_permission_mode(&permission, &mode)
+    );
+}
+
+GG_TEST_DEFINE(artifact_permission_mode_absent) {
+    mode_t mode = 0;
+
+    GG_TEST_ASSERT_OK(get_artifact_permission_mode(NULL, &mode));
+    TEST_ASSERT_EQUAL_HEX16(0755, mode);
+}
+
+GG_TEST_DEFINE(remaining_component_config_invalid_access_control) {
+    GgMap policy = GG_MAP(gg_kv(
+        GG_STR("resources"),
+        gg_obj_list(GG_LIST(gg_obj_buf(GG_STR("invalid?/resource"))))
+    ));
+    GgMap service = GG_MAP(gg_kv(GG_STR("policy"), gg_obj_map(policy)));
+    GgMap access_control
+        = GG_MAP(gg_kv(GG_STR("aws.greengrass.ipc.pubsub"), gg_obj_map(service))
+        );
+    GgMap merge
+        = GG_MAP(gg_kv(GG_STR("accessControl"), gg_obj_map(access_control)));
+    GgMap config_update = GG_MAP(
+        gg_kv(GG_STR("merge"), gg_obj_map(merge)),
+        gg_kv(
+            GG_STR("reset"),
+            gg_obj_list(GG_LIST(gg_obj_buf(GG_STR("/legacyKey"))))
+        )
+    );
+    GgMap component_to_configuration
+        = GG_MAP(gg_kv(GG_STR("secondPassOnly"), gg_obj_map(config_update)));
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_INVALID,
+        apply_remaining_component_configurations(
+            component_to_configuration, (GgMap) { 0 }
+        )
+    );
+}
+
+GG_TEST_DEFINE(remaining_component_config_skips_resolved) {
+    GgMap component_to_configuration
+        = GG_MAP(gg_kv(GG_STR("alreadyResolved"), gg_obj_i64(1)));
+    GgMap resolved_components
+        = GG_MAP(gg_kv(GG_STR("alreadyResolved"), gg_obj_buf(GG_STR("1.0.0"))));
+
+    GG_TEST_ASSERT_OK(apply_remaining_component_configurations(
+        component_to_configuration, resolved_components
+    ));
+}
+
+GG_TEST_DEFINE(thing_groups_parser_returns_valid_list_contents) {
+    uint8_t response[]
+        = "{\"thingGroups\":[{\"thingGroupName\":\"alpha\"},{\"thingGroupName\":\"beta\"}]}";
+    uint8_t arena_mem[512];
+    GgArena alloc = gg_arena_init(GG_BUF(arena_mem));
+    GgObject *result = NULL;
+
+    GG_TEST_ASSERT_OK(parse_thing_groups_list(
+        (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+        &alloc,
+        &result
+    ));
+    TEST_ASSERT_NOT_NULL(result);
+    GgList list = gg_obj_into_list(*result);
+    TEST_ASSERT_EQUAL_size_t(2, list.len);
+
+    GgObject *name = NULL;
+    TEST_ASSERT_TRUE(gg_map_get(
+        gg_obj_into_map(list.items[0]), GG_STR("thingGroupName"), &name
+    ));
+    TEST_ASSERT_TRUE(gg_buffer_eq(gg_obj_into_buf(*name), GG_STR("alpha")));
+    TEST_ASSERT_TRUE(gg_map_get(
+        gg_obj_into_map(list.items[1]), GG_STR("thingGroupName"), &name
+    ));
+    TEST_ASSERT_TRUE(gg_buffer_eq(gg_obj_into_buf(*name), GG_STR("beta")));
+}
+
+GG_TEST_DEFINE(thing_groups_parser_preserves_output_on_malformed_json) {
+    uint8_t response[] = "{\"thingGroups\":";
+    uint8_t arena_mem[128];
+    GgArena alloc = gg_arena_init(GG_BUF(arena_mem));
+    GgObject sentinel = gg_obj_i64(7);
+    GgObject *result = &sentinel;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_PARSE,
+        parse_thing_groups_list(
+            (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+            &alloc,
+            &result
+        )
+    );
+    TEST_ASSERT_EQUAL_PTR(&sentinel, result);
+}
+
+GG_TEST_DEFINE(thing_groups_parser_rejects_non_map_without_output) {
+    uint8_t response[] = "[]";
+    uint8_t arena_mem[64];
+    GgArena alloc = gg_arena_init(GG_BUF(arena_mem));
+    GgObject sentinel = gg_obj_i64(7);
+    GgObject *result = &sentinel;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_PARSE,
+        parse_thing_groups_list(
+            (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+            &alloc,
+            &result
+        )
+    );
+    TEST_ASSERT_EQUAL_PTR(&sentinel, result);
+}
+
+GG_TEST_DEFINE(thing_groups_parser_rejects_missing_field_without_output) {
+    uint8_t response[] = "{\"message\":\"error\"}";
+    uint8_t arena_mem[128];
+    GgArena alloc = gg_arena_init(GG_BUF(arena_mem));
+    GgObject sentinel = gg_obj_i64(7);
+    GgObject *result = &sentinel;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_PARSE,
+        parse_thing_groups_list(
+            (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+            &alloc,
+            &result
+        )
+    );
+    TEST_ASSERT_EQUAL_PTR(&sentinel, result);
+}
+
+GG_TEST_DEFINE(thing_groups_parser_rejects_wrong_type_without_output) {
+    uint8_t response[] = "{\"thingGroups\":{}}";
+    uint8_t arena_mem[128];
+    GgArena alloc = gg_arena_init(GG_BUF(arena_mem));
+    GgObject sentinel = gg_obj_i64(7);
+    GgObject *result = &sentinel;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_PARSE,
+        parse_thing_groups_list(
+            (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+            &alloc,
+            &result
+        )
+    );
+    TEST_ASSERT_EQUAL_PTR(&sentinel, result);
+}
+
+static void handler_assert_dataplane_schema_failure(
+    GgBuffer response, GgError expected_error
+) {
+    uint8_t version_mem[4] = { 'k', 'e', 'e', 'p' };
+    GgBuffer version = GG_BUF(version_mem);
+    handler_dataplane_config_write_calls = 0;
+    dataplane_config_write = handler_fake_dataplane_config_write;
+
+    TEST_ASSERT_EQUAL_INT(
+        expected_error,
+        parse_dataplane_response_and_save_recipe(response, NULL, &version)
+    );
+    TEST_ASSERT_EQUAL_size_t(sizeof(version_mem), version.len);
+    TEST_ASSERT_EQUAL_MEMORY("keep", version_mem, sizeof(version_mem));
+    TEST_ASSERT_EQUAL_size_t(0, handler_dataplane_config_write_calls);
+}
+
+GG_TEST_DEFINE(dataplane_parser_rejects_malformed_json_without_output) {
+    uint8_t response[] = "{\"resolvedComponentVersions\":";
+    handler_assert_dataplane_schema_failure(
+        (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+        GG_ERR_PARSE
+    );
+}
+
+GG_TEST_DEFINE(dataplane_parser_rejects_non_map_without_output) {
+    uint8_t response[] = "[]";
+    handler_assert_dataplane_schema_failure(
+        (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+        GG_ERR_PARSE
+    );
+}
+
+GG_TEST_DEFINE(dataplane_parser_rejects_missing_list_without_output) {
+    uint8_t response[] = "{\"message\":\"error\"}";
+    handler_assert_dataplane_schema_failure(
+        (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+        GG_ERR_PARSE
+    );
+}
+
+GG_TEST_DEFINE(dataplane_parser_rejects_wrong_list_type_without_output) {
+    uint8_t response[] = "{\"resolvedComponentVersions\":{}}";
+    handler_assert_dataplane_schema_failure(
+        (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+        GG_ERR_PARSE
+    );
+}
+
+GG_TEST_DEFINE(dataplane_parser_rejects_empty_list_without_output) {
+    uint8_t response[] = "{\"resolvedComponentVersions\":[]}";
+    handler_assert_dataplane_schema_failure(
+        (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+        GG_ERR_PARSE
+    );
+}
+
+GG_TEST_DEFINE(dataplane_parser_rejects_non_map_item_without_output) {
+    uint8_t response[] = "{\"resolvedComponentVersions\":[1]}";
+    handler_assert_dataplane_schema_failure(
+        (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+        GG_ERR_PARSE
+    );
+}
+
+GG_TEST_DEFINE(dataplane_parser_rejects_wrong_item_field_type_without_output) {
+    uint8_t response[]
+        = "{\"resolvedComponentVersions\":[{\"arn\":\"test-arn\",\"componentName\":\"Test.Component\",\"componentVersion\":1,\"recipe\":\"e30=\"}]}";
+    handler_assert_dataplane_schema_failure(
+        (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+        GG_ERR_PARSE
+    );
+}
+
+GG_TEST_DEFINE(dataplane_parser_rejects_multiple_items_without_output) {
+    uint8_t response[] = "{\"resolvedComponentVersions\":[{},{}]}";
+    handler_assert_dataplane_schema_failure(
+        (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+        GG_ERR_INVALID
+    );
+}
+
+GG_TEST_DEFINE(dataplane_parser_exact_version_capacity_succeeds) {
+    char root_path[PATH_MAX];
+    handler_create_recipe_test_root(root_path);
+    char recipe_path[PATH_MAX];
+    handler_build_recipe_test_path(recipe_path, root_path, "1.2.3");
+    GglDeploymentHandlerThreadArgs args = {
+        .root_path = gg_buffer_from_null_term(root_path),
+    };
+    uint8_t response[]
+        = "{\"resolvedComponentVersions\":[{\"arn\":\"test-arn\",\"componentName\":\"Test.Component\",\"componentVersion\":\"1.2.3\",\"recipe\":\"e30=\"}]}";
+    uint8_t version_mem[5] = { 0 };
+    GgBuffer version = GG_BUF(version_mem);
+    handler_dataplane_config_write_calls = 0;
+    handler_dataplane_config_write_matches = false;
+    dataplane_config_write = handler_fake_dataplane_config_write;
+
+    GG_TEST_ASSERT_OK(parse_dataplane_response_and_save_recipe(
+        (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+        &args,
+        &version
+    ));
+    TEST_ASSERT_EQUAL_size_t(sizeof(version_mem), version.len);
+    TEST_ASSERT_EQUAL_MEMORY("1.2.3", version_mem, sizeof(version_mem));
+    TEST_ASSERT_EQUAL_size_t(1, handler_dataplane_config_write_calls);
+    TEST_ASSERT_TRUE(handler_dataplane_config_write_matches);
+
+    int fd = open(recipe_path, O_RDONLY);
+    TEST_ASSERT_GREATER_OR_EQUAL_INT(0, fd);
+    uint8_t contents[3] = { 0 };
+    ssize_t read_len = read(fd, contents, sizeof(contents));
+    TEST_ASSERT_EQUAL_INT(0, close(fd));
+    TEST_ASSERT_EQUAL_INT(2, read_len);
+    TEST_ASSERT_EQUAL_MEMORY("{}", contents, 2);
+    handler_cleanup_recipe_test_root(root_path, recipe_path);
+}
+
+GG_TEST_DEFINE(dataplane_parser_oversized_version_has_no_side_effects) {
+    char root_path[PATH_MAX];
+    handler_create_recipe_test_root(root_path);
+    char recipe_path[PATH_MAX];
+    handler_build_recipe_test_path(recipe_path, root_path, "12345");
+    GglDeploymentHandlerThreadArgs args = {
+        .root_path = gg_buffer_from_null_term(root_path),
+    };
+    uint8_t response[]
+        = "{\"resolvedComponentVersions\":[{\"arn\":\"test-arn\",\"componentName\":\"Test.Component\",\"componentVersion\":\"12345\",\"recipe\":\"e30=\"}]}";
+    uint8_t version_mem[4] = { 'k', 'e', 'e', 'p' };
+    GgBuffer version = GG_BUF(version_mem);
+    handler_dataplane_config_write_calls = 0;
+    dataplane_config_write = handler_fake_dataplane_config_write;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_RANGE,
+        parse_dataplane_response_and_save_recipe(
+            (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+            &args,
+            &version
+        )
+    );
+    TEST_ASSERT_EQUAL_size_t(sizeof(version_mem), version.len);
+    TEST_ASSERT_EQUAL_MEMORY("keep", version_mem, sizeof(version_mem));
+    TEST_ASSERT_EQUAL_size_t(0, handler_dataplane_config_write_calls);
+    TEST_ASSERT_EQUAL_INT(-1, access(recipe_path, F_OK));
+    handler_cleanup_recipe_test_root(root_path, recipe_path);
+}
+
+GG_TEST_DEFINE(dataplane_parser_invalid_base64_publishes_version_first) {
+    char root_path[PATH_MAX];
+    handler_create_recipe_test_root(root_path);
+    char recipe_path[PATH_MAX];
+    handler_build_recipe_test_path(recipe_path, root_path, "1.0.0");
+    GglDeploymentHandlerThreadArgs args = {
+        .root_path = gg_buffer_from_null_term(root_path),
+    };
+    uint8_t response[]
+        = "{\"resolvedComponentVersions\":[{\"arn\":\"test-arn\",\"componentName\":\"Test.Component\",\"componentVersion\":\"1.0.0\",\"recipe\":\"!\"}]}";
+    uint8_t version_mem[8] = { 'k', 'e', 'e', 'p' };
+    GgBuffer version = GG_BUF(version_mem);
+    handler_dataplane_config_write_calls = 0;
+    dataplane_config_write = handler_fake_dataplane_config_write;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_PARSE,
+        parse_dataplane_response_and_save_recipe(
+            (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+            &args,
+            &version
+        )
+    );
+    TEST_ASSERT_EQUAL_size_t(5, version.len);
+    TEST_ASSERT_EQUAL_MEMORY("1.0.0", version_mem, 5);
+    TEST_ASSERT_EQUAL_size_t(0, handler_dataplane_config_write_calls);
+    TEST_ASSERT_EQUAL_INT(-1, access(recipe_path, F_OK));
+    handler_cleanup_recipe_test_root(root_path, recipe_path);
+}
+
+GG_TEST_DEFINE(dataplane_parser_rejects_empty_recipe_without_side_effects) {
+    char root_path[PATH_MAX];
+    handler_create_recipe_test_root(root_path);
+    char recipe_path[PATH_MAX];
+    handler_build_recipe_test_path(recipe_path, root_path, "1.0.0");
+    GglDeploymentHandlerThreadArgs args = {
+        .root_path = gg_buffer_from_null_term(root_path),
+    };
+    uint8_t response[]
+        = "{\"resolvedComponentVersions\":[{\"arn\":\"test-arn\",\"componentName\":\"Test.Component\",\"componentVersion\":\"1.0.0\",\"recipe\":\"\"}]}";
+    uint8_t version_mem[8] = { 0 };
+    GgBuffer version = GG_BUF(version_mem);
+    handler_dataplane_config_write_calls = 0;
+    dataplane_config_write = handler_fake_dataplane_config_write;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_INVALID,
+        parse_dataplane_response_and_save_recipe(
+            (GgBuffer) { .data = response, .len = sizeof(response) - 1 },
+            &args,
+            &version
+        )
+    );
+    TEST_ASSERT_EQUAL_size_t(5, version.len);
+    TEST_ASSERT_EQUAL_MEMORY("1.0.0", version_mem, 5);
+    TEST_ASSERT_EQUAL_size_t(0, handler_dataplane_config_write_calls);
+    TEST_ASSERT_EQUAL_INT(-1, access(recipe_path, F_OK));
+    handler_cleanup_recipe_test_root(root_path, recipe_path);
+}
+
+GG_TEST_DEFINE(resolve_dependencies_propagates_malformed_cloud_thing_groups) {
+    uint8_t response[] = "{\"thingGroups\":";
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_PARSE,
+        handler_resolve_with_cloud_thing_groups((GgBuffer
+        ) { .data = response, .len = sizeof(response) - 1 })
+    );
+    TEST_ASSERT_EQUAL_size_t(0, handler_thing_groups_config_write_calls);
+}
+
+GG_TEST_DEFINE(resolve_dependencies_rejects_cloud_schema_without_persistence) {
+    uint8_t response[] = "{\"message\":\"error\"}";
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_PARSE,
+        handler_resolve_with_cloud_thing_groups((GgBuffer
+        ) { .data = response, .len = sizeof(response) - 1 })
+    );
+    TEST_ASSERT_EQUAL_size_t(0, handler_thing_groups_config_write_calls);
+}
+
+// ---- F-DH-E-01 configArn list reader/writer test doubles ----
+
+static GgError handler_arn_list_read_error;
+static GgObject handler_arn_list_read_value;
+
+static GgError handler_fake_arn_list_reader(
+    GgBufList key_path, GgArena *alloc, GgObject *result
+) {
+    (void) key_path;
+    (void) alloc;
+    if (handler_arn_list_read_error != GG_ERR_OK) {
+        return handler_arn_list_read_error;
+    }
+    *result = handler_arn_list_read_value;
+    return GG_ERR_OK;
+}
+
+static size_t handler_configarn_write_calls;
+static GgObject handler_configarn_write_items[MAX_DEPLOYMENT_TARGETS];
+static size_t handler_configarn_write_len;
+
+// Copies the written list items so tests can inspect them after the callee
+// frame that owns the list array is gone; the buffer bytes are string literals
+// and remain valid.
+static GgError handler_fake_configarn_write(
+    GgBufList key_path, GgObject value, const int64_t *timestamp
+) {
+    (void) key_path;
+    (void) timestamp;
+    handler_configarn_write_calls += 1;
+    GgList list = gg_obj_into_list(value);
+    handler_configarn_write_len = list.len;
+    for (size_t i = 0; (i < list.len) && (i < (size_t) MAX_DEPLOYMENT_TARGETS);
+         i++) {
+        handler_configarn_write_items[i] = list.items[i];
+    }
+    return GG_ERR_OK;
+}
+
+static void handler_prime_arn_list(GgError read_error, GgObject read_value) {
+    handler_arn_list_read_error = read_error;
+    handler_arn_list_read_value = read_value;
+    ggl_deployment_config_set_reader_for_test(handler_fake_arn_list_reader);
+    handler_configarn_write_calls = 0;
+    handler_configarn_write_len = 0;
+    configarn_config_write = handler_fake_configarn_write;
+}
+
+static void handler_reset_arn_list_seams(void) {
+    ggl_deployment_config_set_reader_for_test(NULL);
+    configarn_config_write = ggl_gg_config_write;
+}
+
+GG_TEST_DEFINE(add_arn_list_non_buffer_member_is_invalid_without_write) {
+    GgObject items[] = {
+        gg_obj_buf(GG_STR("grp1:1")),
+        gg_obj_i64(5),
+    };
+    handler_prime_arn_list(
+        GG_ERR_OK, gg_obj_list((GgList) { .items = items, .len = 2 })
+    );
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_INVALID,
+        add_arn_list_to_config(GG_STR("Test.Component"), GG_STR("grp2:1"))
+    );
+    TEST_ASSERT_EQUAL_size_t(0, handler_configarn_write_calls);
+
+    handler_reset_arn_list_seams();
+}
+
+GG_TEST_DEFINE(read_config_arn_list_non_buffer_member_leaves_output_unchanged) {
+    GgObject items[] = {
+        gg_obj_buf(GG_STR("grp1:1")),
+        gg_obj_i64(5),
+    };
+    handler_prime_arn_list(
+        GG_ERR_OK, gg_obj_list((GgList) { .items = items, .len = 2 })
+    );
+
+    // Sentinel outputs that must be left untouched on the error path.
+    uint8_t scratch[256];
+    GgArena alloc = gg_arena_init(GG_BUF(scratch));
+    GgObject arn_list_obj = gg_obj_i64(1234);
+    bool present = true;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_INVALID,
+        read_config_arn_list(
+            GG_STR("Test.Component"), &alloc, &arn_list_obj, &present
+        )
+    );
+    // Malformed persisted data must not publish either output.
+    TEST_ASSERT_EQUAL_INT(GG_TYPE_I64, gg_obj_type(arn_list_obj));
+    TEST_ASSERT_EQUAL_INT64(1234, gg_obj_into_i64(arn_list_obj));
+    TEST_ASSERT_TRUE(present);
+
+    handler_reset_arn_list_seams();
+}
+
+GG_TEST_DEFINE(read_config_arn_list_wrong_top_level_leaves_output_unchanged) {
+    // Persisted top-level value is a buffer, not a list.
+    handler_prime_arn_list(GG_ERR_OK, gg_obj_buf(GG_STR("not-a-list")));
+
+    uint8_t scratch[256];
+    GgArena alloc = gg_arena_init(GG_BUF(scratch));
+    GgObject arn_list_obj = gg_obj_i64(1234);
+    bool present = true;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_INVALID,
+        read_config_arn_list(
+            GG_STR("Test.Component"), &alloc, &arn_list_obj, &present
+        )
+    );
+    TEST_ASSERT_EQUAL_INT(GG_TYPE_I64, gg_obj_type(arn_list_obj));
+    TEST_ASSERT_EQUAL_INT64(1234, gg_obj_into_i64(arn_list_obj));
+    TEST_ASSERT_TRUE(present);
+
+    handler_reset_arn_list_seams();
+}
+
+GG_TEST_DEFINE(read_config_arn_list_unrelated_error_leaves_output_unchanged) {
+    handler_prime_arn_list(GG_ERR_NOCONN, (GgObject) { 0 });
+
+    uint8_t scratch[256];
+    GgArena alloc = gg_arena_init(GG_BUF(scratch));
+    GgObject arn_list_obj = gg_obj_i64(1234);
+    bool present = true;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_FAILURE,
+        read_config_arn_list(
+            GG_STR("Test.Component"), &alloc, &arn_list_obj, &present
+        )
+    );
+    TEST_ASSERT_EQUAL_INT(GG_TYPE_I64, gg_obj_type(arn_list_obj));
+    TEST_ASSERT_EQUAL_INT64(1234, gg_obj_into_i64(arn_list_obj));
+    TEST_ASSERT_TRUE(present);
+    TEST_ASSERT_EQUAL_size_t(0, handler_configarn_write_calls);
+
+    handler_reset_arn_list_seams();
+}
+
+GG_TEST_DEFINE(add_arn_list_appends_new_group) {
+    GgObject items[] = { gg_obj_buf(GG_STR("grp1:1")) };
+    handler_prime_arn_list(
+        GG_ERR_OK, gg_obj_list((GgList) { .items = items, .len = 1 })
+    );
+
+    GG_TEST_ASSERT_OK(
+        add_arn_list_to_config(GG_STR("Test.Component"), GG_STR("grp2:1"))
+    );
+    TEST_ASSERT_EQUAL_size_t(1, handler_configarn_write_calls);
+    TEST_ASSERT_EQUAL_size_t(2, handler_configarn_write_len);
+    TEST_ASSERT_TRUE(gg_buffer_eq(
+        gg_obj_into_buf(handler_configarn_write_items[0]), GG_STR("grp1:1")
+    ));
+    TEST_ASSERT_TRUE(gg_buffer_eq(
+        gg_obj_into_buf(handler_configarn_write_items[1]), GG_STR("grp2:1")
+    ));
+
+    handler_reset_arn_list_seams();
+}
+
+GG_TEST_DEFINE(add_arn_list_replaces_matching_group) {
+    GgObject items[] = { gg_obj_buf(GG_STR("grp1:1")) };
+    handler_prime_arn_list(
+        GG_ERR_OK, gg_obj_list((GgList) { .items = items, .len = 1 })
+    );
+
+    GG_TEST_ASSERT_OK(
+        add_arn_list_to_config(GG_STR("Test.Component"), GG_STR("grp1:2"))
+    );
+    TEST_ASSERT_EQUAL_size_t(1, handler_configarn_write_calls);
+    TEST_ASSERT_EQUAL_size_t(1, handler_configarn_write_len);
+    TEST_ASSERT_TRUE(gg_buffer_eq(
+        gg_obj_into_buf(handler_configarn_write_items[0]), GG_STR("grp1:2")
+    ));
+
+    handler_reset_arn_list_seams();
+}
+
+GG_TEST_DEFINE(add_arn_list_missing_entry_writes_single_arn) {
+    handler_prime_arn_list(GG_ERR_NOENTRY, (GgObject) { 0 });
+
+    GG_TEST_ASSERT_OK(
+        add_arn_list_to_config(GG_STR("Test.Component"), GG_STR("grp1:1"))
+    );
+    TEST_ASSERT_EQUAL_size_t(1, handler_configarn_write_calls);
+    TEST_ASSERT_EQUAL_size_t(1, handler_configarn_write_len);
+    TEST_ASSERT_TRUE(gg_buffer_eq(
+        gg_obj_into_buf(handler_configarn_write_items[0]), GG_STR("grp1:1")
+    ));
+
+    handler_reset_arn_list_seams();
+}
+
+GG_TEST_DEFINE(deployment_roots_collect_valid_component) {
+    GgMap component
+        = GG_MAP(gg_kv(GG_STR("version"), gg_obj_buf(GG_STR("1.0.0"))));
+    GgMap roots
+        = GG_MAP(gg_kv(GG_STR("Test.Component"), gg_obj_map(component)));
+    GgKVVec collected = GG_KV_VEC((GgKV[1]) { 0 });
+
+    GG_TEST_ASSERT_OK(collect_deployment_root_components(roots, &collected));
+    TEST_ASSERT_EQUAL_size_t(1, collected.map.len);
+    TEST_ASSERT_TRUE(gg_buffer_eq(
+        gg_kv_key(collected.map.pairs[0]), GG_STR("Test.Component")
+    ));
+}
+
+GG_TEST_DEFINE(deployment_roots_reject_non_map_component) {
+    GgMap roots = GG_MAP(gg_kv(GG_STR("Test.Component"), gg_obj_i64(1)));
+    GgKVVec collected = GG_KV_VEC((GgKV[1]) { 0 });
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_INVALID, collect_deployment_root_components(roots, &collected)
+    );
+    TEST_ASSERT_EQUAL_size_t(0, collected.map.len);
+}
+
+GG_TEST_DEFINE(root_merge_equal_requirement_is_not_duplicated) {
+    GgKVVec roots = GG_KV_VEC((GgKV[2]) { 0 });
+    GG_TEST_ASSERT_OK(
+        gg_kv_vec_push(&roots, gg_kv(GG_STR("A"), gg_obj_buf(GG_STR("1.0.0"))))
+    );
+    GgArena names = gg_arena_init(GG_BUF((uint8_t[16]) { 0 }));
+    GgArena versions = gg_arena_init(GG_BUF((uint8_t[16]) { 0 }));
+    bool added = true;
+
+    GG_TEST_ASSERT_OK(merge_root_component_requirement(
+        &roots, GG_STR("A"), GG_STR("1.0.0"), &names, &versions, &added
+    ));
+    TEST_ASSERT_FALSE(added);
+    TEST_ASSERT_EQUAL_size_t(1, roots.map.len);
+}
+
+GG_TEST_DEFINE(root_merge_rejects_conflicting_requirement) {
+    GgKVVec roots = GG_KV_VEC((GgKV[2]) { 0 });
+    GG_TEST_ASSERT_OK(
+        gg_kv_vec_push(&roots, gg_kv(GG_STR("A"), gg_obj_buf(GG_STR("1.0.0"))))
+    );
+    GgArena names = gg_arena_init(GG_BUF((uint8_t[16]) { 0 }));
+    GgArena versions = gg_arena_init(GG_BUF((uint8_t[16]) { 0 }));
+    bool added = true;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_INVALID,
+        merge_root_component_requirement(
+            &roots, GG_STR("A"), GG_STR("2.0.0"), &names, &versions, &added
+        )
+    );
+    TEST_ASSERT_FALSE(added);
+    TEST_ASSERT_EQUAL_size_t(1, roots.map.len);
+}
+
+GG_TEST_DEFINE(root_merge_propagates_vector_capacity) {
+    GgKVVec roots = GG_KV_VEC((GgKV[1]) { 0 });
+    GG_TEST_ASSERT_OK(
+        gg_kv_vec_push(&roots, gg_kv(GG_STR("A"), gg_obj_buf(GG_STR("1.0.0"))))
+    );
+    GgMap additional = GG_MAP(gg_kv(GG_STR("B"), gg_obj_buf(GG_STR("1.0.0"))));
+    GgArena names = gg_arena_init(GG_BUF((uint8_t[16]) { 0 }));
+    GgArena versions = gg_arena_init(GG_BUF((uint8_t[16]) { 0 }));
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_NOMEM,
+        merge_root_component_map(
+            additional, GG_STR("test"), &roots, &names, &versions
+        )
+    );
+    TEST_ASSERT_EQUAL_size_t(1, roots.map.len);
+}
+
+GG_TEST_DEFINE(thing_group_merge_rejects_non_map_item) {
+    GgObject item = gg_obj_i64(1);
+    GgKVVec roots = GG_KV_VEC((GgKV[1]) { 0 });
+    GgArena names = gg_arena_init(GG_BUF((uint8_t[16]) { 0 }));
+    GgArena versions = gg_arena_init(GG_BUF((uint8_t[16]) { 0 }));
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_INVALID,
+        merge_thing_group_root_components(
+            (GgList) { .items = &item, .len = 1 },
+            GG_STR("current"),
+            &roots,
+            &names,
+            &versions
+        )
+    );
+}
+
+GG_TEST_DEFINE(local_root_merge_propagates_vector_capacity) {
+    GgKVVec roots = GG_KV_VEC((GgKV[1]) { 0 });
+    GG_TEST_ASSERT_OK(
+        gg_kv_vec_push(&roots, gg_kv(GG_STR("A"), gg_obj_buf(GG_STR("1.0.0"))))
+    );
+    handler_resolve_read_error = GG_ERR_OK;
+    handler_resolve_read_value
+        = gg_obj_map(GG_MAP(gg_kv(GG_STR("B"), gg_obj_buf(GG_STR("1.0.0")))));
+    resolve_config_read = handler_fake_resolve_config_read;
+    GgArena names = gg_arena_init(GG_BUF((uint8_t[16]) { 0 }));
+    GgArena versions = gg_arena_init(GG_BUF((uint8_t[16]) { 0 }));
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_NOMEM,
+        merge_local_root_components(GG_STR("group"), &roots, &names, &versions)
+    );
+    TEST_ASSERT_EQUAL_size_t(1, roots.map.len);
+}
+
+GG_TEST_DEFINE(thing_group_replacement_preserves_dependency_arena) {
+    GgMap previous
+        = GG_MAP(gg_kv(GG_STR("Old.Component"), gg_obj_buf(GG_STR("1.0.0"))));
+    handler_resolve_read_error = GG_ERR_OK;
+    handler_resolve_read_value = gg_obj_map(previous);
+    handler_resolve_delete_calls = 0;
+    handler_resolve_write_calls = 0;
+    handler_first_resolve_write_error = GG_ERR_OK;
+    resolve_config_read = handler_fake_cloning_resolve_config_read;
+    resolve_config_delete = handler_fake_resolve_config_delete;
+    resolve_config_write = handler_fake_transactional_config_write;
+    resolve_get_device_thing_groups = handler_fake_cloud_thing_groups;
+    handler_config_read_error = GG_ERR_NOENTRY;
+    ggl_deployment_config_set_reader_for_test(handler_fake_config_reader);
+
+    uint8_t dependency_mem[1];
+    GgArena dependency_alloc = gg_arena_init(GG_BUF(dependency_mem));
+    GgKVVec resolved_components = GG_KV_VEC((GgKV[1]) { 0 });
+    bool depends_on_token_exchange_service = true;
+
+    GG_TEST_ASSERT_OK(resolve_dependencies(
+        (GgMap) { 0 },
+        GG_STR("LOCAL_DEPLOYMENTS"),
+        LOCAL_DEPLOYMENT,
+        NULL,
+        &dependency_alloc,
+        &resolved_components,
+        &depends_on_token_exchange_service
+    ));
+    TEST_ASSERT_EQUAL_UINT32(0, dependency_alloc.index);
+    TEST_ASSERT_EQUAL_size_t(1, handler_resolve_delete_calls);
+    TEST_ASSERT_EQUAL_size_t(1, handler_resolve_write_calls);
+}
+
+GG_TEST_DEFINE(thing_group_replacement_restores_previous_mapping) {
+    GgMap previous = GG_MAP(gg_kv(GG_STR("Old"), gg_obj_buf(GG_STR("1.0.0"))));
+    GgMap replacement
+        = GG_MAP(gg_kv(GG_STR("New"), gg_obj_buf(GG_STR("2.0.0"))));
+    handler_resolve_read_error = GG_ERR_OK;
+    handler_resolve_read_value = gg_obj_map(previous);
+    handler_resolve_delete_calls = 0;
+    handler_resolve_write_calls = 0;
+    handler_first_resolve_write_error = GG_ERR_FAILURE;
+    handler_second_resolve_write_error = GG_ERR_OK;
+    resolve_config_read = handler_fake_cloning_resolve_config_read;
+    resolve_config_delete = handler_fake_resolve_config_delete;
+    resolve_config_write = handler_fake_transactional_config_write;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_FAILURE,
+        replace_thing_group_root_mapping(GG_STR("group"), replacement)
+    );
+    TEST_ASSERT_EQUAL_size_t(1, handler_resolve_delete_calls);
+    TEST_ASSERT_EQUAL_size_t(2, handler_resolve_write_calls);
+    GgObject *restored_version = NULL;
+    TEST_ASSERT_TRUE(gg_map_get(
+        gg_obj_into_map(handler_last_resolve_write_value),
+        GG_STR("Old"),
+        &restored_version
+    ));
+    TEST_ASSERT_TRUE(
+        gg_buffer_eq(gg_obj_into_buf(*restored_version), GG_STR("1.0.0"))
+    );
+}
+
+GG_TEST_DEFINE(thing_group_replacement_preserves_original_write_error) {
+    GgMap previous = GG_MAP(gg_kv(GG_STR("Old"), gg_obj_buf(GG_STR("1.0.0"))));
+    GgMap replacement
+        = GG_MAP(gg_kv(GG_STR("New"), gg_obj_buf(GG_STR("2.0.0"))));
+    handler_resolve_read_error = GG_ERR_OK;
+    handler_resolve_read_value = gg_obj_map(previous);
+    handler_resolve_delete_calls = 0;
+    handler_resolve_write_calls = 0;
+    handler_first_resolve_write_error = GG_ERR_FAILURE;
+    handler_second_resolve_write_error = GG_ERR_NOMEM;
+    resolve_config_read = handler_fake_cloning_resolve_config_read;
+    resolve_config_delete = handler_fake_resolve_config_delete;
+    resolve_config_write = handler_fake_transactional_config_write;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_FAILURE,
+        replace_thing_group_root_mapping(GG_STR("group"), replacement)
+    );
+    TEST_ASSERT_EQUAL_size_t(1, handler_resolve_delete_calls);
+    TEST_ASSERT_EQUAL_size_t(2, handler_resolve_write_calls);
+    GgObject *restored_version = NULL;
+    TEST_ASSERT_TRUE(gg_map_get(
+        gg_obj_into_map(handler_last_resolve_write_value),
+        GG_STR("Old"),
+        &restored_version
+    ));
+    TEST_ASSERT_TRUE(
+        gg_buffer_eq(gg_obj_into_buf(*restored_version), GG_STR("1.0.0"))
+    );
+}
+
+GG_TEST_DEFINE(single_component_resolution_uses_local_candidate) {
+    resolve_local_component = handler_fake_local_candidate_found;
+    GgArena alloc = gg_arena_init(GG_BUF((uint8_t[64]) { 0 }));
+    GgKVVec resolved = GG_KV_VEC((GgKV[1]) { 0 });
+    GgBuffer version = GG_BUF((uint8_t[NAME_MAX]) { 0 });
+
+    GG_TEST_ASSERT_OK(resolve_single_component_version(
+        GG_STR("Test.Component"),
+        GG_STR("^1.0.0"),
+        NULL,
+        &alloc,
+        &resolved,
+        &version
+    ));
+    TEST_ASSERT_EQUAL_size_t(1, resolved.map.len);
+    TEST_ASSERT_TRUE(gg_buffer_eq(version, GG_STR("1.2.3")));
+}
+
+GG_TEST_DEFINE(cloud_resolution_failure_logs_component_name) {
+    resolve_local_component = handler_fake_local_candidate_missing;
+    resolve_cloud_component = handler_fake_empty_cloud_resolution;
+    cloud_resolution_failure_logger = handler_fake_resolution_failure_logger;
+    handler_logged_resolution_component = (GgBuffer) { 0 };
+    GgArena alloc = gg_arena_init(GG_BUF((uint8_t[64]) { 0 }));
+    GgKVVec resolved = GG_KV_VEC((GgKV[1]) { 0 });
+    GgBuffer version = GG_BUF((uint8_t[NAME_MAX]) { 0 });
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_FAILURE,
+        resolve_single_component_version(
+            GG_STR("Test.Component"),
+            GG_STR(">=1.0.0"),
+            NULL,
+            &alloc,
+            &resolved,
+            &version
+        )
+    );
+    TEST_ASSERT_TRUE(gg_buffer_eq(
+        handler_logged_resolution_component, GG_STR("Test.Component")
+    ));
+    TEST_ASSERT_EQUAL_size_t(0, resolved.map.len);
+}
+
+GG_TEST_DEFINE(health_read_failure_enqueues_component_once) {
+    retrieve_component_status = handler_fake_component_status;
+    handler_health_error = GG_ERR_NOCONN;
+    GgKVVec selected = GG_KV_VEC((GgKV[2]) { 0 });
+
+    GG_TEST_ASSERT_OK(select_component_for_deployment(
+        GG_STR("Test.Component"),
+        gg_obj_buf(GG_STR("1.0.0")),
+        false,
+        false,
+        &selected
+    ));
+    TEST_ASSERT_EQUAL_size_t(1, selected.map.len);
+}
+
+GG_TEST_DEFINE(existing_component_classifier_recognizes_running) {
+    retrieve_component_status = handler_fake_component_status;
+    handler_health_error = GG_ERR_OK;
+    handler_health_status = GG_STR("RUNNING");
+    ComponentLifecycleClassification classification
+        = COMPONENT_NEEDS_DEPLOYMENT;
+
+    GG_TEST_ASSERT_OK(
+        classify_existing_component(GG_STR("Test.Component"), &classification)
+    );
+    TEST_ASSERT_EQUAL_INT(COMPONENT_ALREADY_RUNNING, classification);
+}
+
+GG_TEST_DEFINE(existing_component_classifier_recognizes_finished) {
+    retrieve_component_status = handler_fake_component_status;
+    handler_health_error = GG_ERR_OK;
+    handler_health_status = GG_STR("FINISHED");
+    ComponentLifecycleClassification classification
+        = COMPONENT_NEEDS_DEPLOYMENT;
+
+    GG_TEST_ASSERT_OK(
+        classify_existing_component(GG_STR("Test.Component"), &classification)
+    );
+    TEST_ASSERT_EQUAL_INT(COMPONENT_ALREADY_RUNNING, classification);
+}
+
+GG_TEST_DEFINE(non_running_component_enqueues_once) {
+    retrieve_component_status = handler_fake_component_status;
+    handler_health_error = GG_ERR_OK;
+    handler_health_status = GG_STR("ERRORED");
+    GgKVVec selected = GG_KV_VEC((GgKV[2]) { 0 });
+
+    GG_TEST_ASSERT_OK(select_component_for_deployment(
+        GG_STR("Test.Component"),
+        gg_obj_buf(GG_STR("1.0.0")),
+        false,
+        false,
+        &selected
+    ));
+    TEST_ASSERT_EQUAL_size_t(1, selected.map.len);
+}
+
+GG_TEST_DEFINE(component_selection_propagates_vector_capacity) {
+    GgKVVec selected = GG_KV_VEC((GgKV[1]) { 0 });
+    GG_TEST_ASSERT_OK(gg_kv_vec_push(
+        &selected, gg_kv(GG_STR("Existing"), gg_obj_buf(GG_STR("1.0.0")))
+    ));
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_NOMEM,
+        select_component_for_deployment(
+            GG_STR("Test.Component"),
+            gg_obj_buf(GG_STR("2.0.0")),
+            true,
+            false,
+            &selected
+        )
+    );
+    TEST_ASSERT_EQUAL_size_t(1, selected.map.len);
+}
+
+GG_TEST_DEFINE(bootstrap_orchestration_preserves_process_wait_order) {
+    orchestrate_process_bootstrap = handler_fake_process_bootstrap;
+    orchestrate_wait_for_phase = handler_fake_wait_for_phase;
+    handler_bootstrap_result = GG_ERR_OK;
+    handler_wait_result = GG_ERR_OK;
+    handler_lifecycle_call_order = 0;
+    handler_bootstrap_call_order = 0;
+    handler_wait_call_order = 0;
+
+    GG_TEST_ASSERT_OK(
+        orchestrate_bootstrap_lifecycle((GgMap) { 0 }, (GgBuffer) { 0 }, NULL)
+    );
+    TEST_ASSERT_EQUAL_size_t(1, handler_bootstrap_call_order);
+    TEST_ASSERT_EQUAL_size_t(2, handler_wait_call_order);
+}
+
+GG_TEST_DEFINE(bootstrap_orchestration_skips_wait_after_process_failure) {
+    orchestrate_process_bootstrap = handler_fake_process_bootstrap;
+    orchestrate_wait_for_phase = handler_fake_wait_for_phase;
+    handler_bootstrap_result = GG_ERR_FAILURE;
+    handler_wait_result = GG_ERR_OK;
+    handler_lifecycle_call_order = 0;
+    handler_wait_call_order = 0;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_FAILURE,
+        orchestrate_bootstrap_lifecycle((GgMap) { 0 }, (GgBuffer) { 0 }, NULL)
+    );
+    TEST_ASSERT_EQUAL_size_t(0, handler_wait_call_order);
+}
+
+GG_TEST_DEFINE(bootstrap_orchestration_propagates_wait_failure) {
+    orchestrate_process_bootstrap = handler_fake_process_bootstrap;
+    orchestrate_wait_for_phase = handler_fake_wait_for_phase;
+    handler_bootstrap_result = GG_ERR_OK;
+    handler_wait_result = GG_ERR_NOCONN;
+    handler_lifecycle_call_order = 0;
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_NOCONN,
+        orchestrate_bootstrap_lifecycle((GgMap) { 0 }, (GgBuffer) { 0 }, NULL)
+    );
+}
+
+#endif
