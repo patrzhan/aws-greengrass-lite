@@ -19,8 +19,8 @@ bool is_component_config_updated(
 );
 
 /// Apply a single component's entry from the deployment's
-/// componentToConfiguration map. Writes the merge payload into
-/// services.<component_name>.configuration in ggconfigd.
+/// componentToConfiguration map. Validates accessControl before applying any
+/// reset or merge update to services.<component_name>.configuration.
 GgError apply_component_to_configuration(
     GgBuffer component_name, GgMap component_to_configuration
 );

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "component_config.h"
+#include "access_control_validation.h"
 #include "deployment_model.h"
 #include <assert.h>
 #include <gg/buffer.h>
@@ -17,6 +18,46 @@
 #include <ggl/json_pointer.h>
 #include <stdbool.h>
 #include <stddef.h>
+
+static GgError get_validated_component_config_update(
+    GgBuffer component_name,
+    GgMap component_to_configuration,
+    GgMap *config_update_map
+) {
+    *config_update_map = (GgMap) { 0 };
+
+    GgObject *config_update_obj;
+    if (!gg_map_get(
+            component_to_configuration, component_name, &config_update_obj
+        )) {
+        return GG_ERR_OK;
+    }
+
+    if (gg_obj_type(*config_update_obj) != GG_TYPE_MAP) {
+        GG_LOGE("component_to_configuration value must be a map.");
+        return GG_ERR_INVALID;
+    }
+
+    GgMap update_map = gg_obj_into_map(*config_update_obj);
+    GgObject *merge_configuration = NULL;
+    GgError ret = gg_map_validate(
+        update_map,
+        GG_MAP_SCHEMA(
+            { GG_STR("merge"), GG_OPTIONAL, GG_TYPE_MAP, &merge_configuration }
+        )
+    );
+    if (ret != GG_ERR_OK) {
+        return ret;
+    }
+
+    ret = validate_access_control_policies(merge_configuration);
+    if (ret != GG_ERR_OK) {
+        return ret;
+    }
+
+    *config_update_map = update_map;
+    return GG_ERR_OK;
+}
 
 static GgError apply_reset_config(
     GgBuffer component_name, GgMap component_config_map
@@ -267,24 +308,23 @@ bool is_component_config_updated(
 GgError apply_component_to_configuration(
     GgBuffer component_name, GgMap component_to_configuration
 ) {
-    GgObject *config_update_obj;
-    if (!gg_map_get(
-            component_to_configuration, component_name, &config_update_obj
-        )) {
-        return GG_ERR_OK;
+    GgMap config_update_map;
+    GgError ret = get_validated_component_config_update(
+        component_name, component_to_configuration, &config_update_map
+    );
+    if (ret != GG_ERR_OK) {
+        GG_LOGE(
+            "Failed to validate componentToConfiguration for %.*s.",
+            (int) component_name.len,
+            component_name.data
+        );
+        return ret;
     }
-
-    if (gg_obj_type(*config_update_obj) != GG_TYPE_MAP) {
-        GG_LOGE("component_to_configuration value must be a map.");
-        return GG_ERR_INVALID;
-    }
-
-    GgMap config_update_map = gg_obj_into_map(*config_update_obj);
 
     // Apply reset BEFORE merge, matching AWS IoT Greengrass Core semantics
     // (reset updates are applied before merge updates — see
     // ComponentConfigurationUpdate docs).
-    GgError ret = apply_reset_config(component_name, config_update_map);
+    ret = apply_reset_config(component_name, config_update_map);
     if (ret != GG_ERR_OK) {
         GG_LOGE(
             "Failed to apply reset for %.*s from componentToConfiguration.",
@@ -357,6 +397,55 @@ GG_TEST_DEFINE(config_updated_has_configuration_update) {
     TEST_ASSERT_TRUE(
         is_component_config_updated(&deployment, GG_STR("myComponent"))
     );
+}
+
+GG_TEST_DEFINE(component_to_configuration_invalid_access_control) {
+    GgMap policy = GG_MAP(gg_kv(
+        GG_STR("resources"),
+        gg_obj_list(GG_LIST(gg_obj_buf(GG_STR("invalid?/resource"))))
+    ));
+    GgMap service = GG_MAP(gg_kv(GG_STR("policy"), gg_obj_map(policy)));
+    GgMap access_control
+        = GG_MAP(gg_kv(GG_STR("aws.greengrass.ipc.pubsub"), gg_obj_map(service))
+        );
+    GgMap merge
+        = GG_MAP(gg_kv(GG_STR("accessControl"), gg_obj_map(access_control)));
+    GgMap config_update = GG_MAP(
+        gg_kv(GG_STR("merge"), gg_obj_map(merge)),
+        gg_kv(GG_STR("reset"), gg_obj_list(GG_LIST(gg_obj_buf(GG_STR("")))))
+    );
+    GgMap component_to_configuration
+        = GG_MAP(gg_kv(GG_STR("myComponent"), gg_obj_map(config_update)));
+
+    TEST_ASSERT_EQUAL_INT(
+        GG_ERR_INVALID,
+        apply_component_to_configuration(
+            GG_STR("myComponent"), component_to_configuration
+        )
+    );
+}
+
+GG_TEST_DEFINE(component_to_configuration_valid_access_control) {
+    GgMap policy = GG_MAP(gg_kv(
+        GG_STR("resources"), gg_obj_list(GG_LIST(gg_obj_buf(GG_STR("valid/*"))))
+    ));
+    GgMap service = GG_MAP(gg_kv(GG_STR("policy"), gg_obj_map(policy)));
+    GgMap access_control
+        = GG_MAP(gg_kv(GG_STR("aws.greengrass.ipc.pubsub"), gg_obj_map(service))
+        );
+    GgMap merge
+        = GG_MAP(gg_kv(GG_STR("accessControl"), gg_obj_map(access_control)));
+    GgMap config_update = GG_MAP(gg_kv(GG_STR("merge"), gg_obj_map(merge)));
+    GgMap component_to_configuration
+        = GG_MAP(gg_kv(GG_STR("myComponent"), gg_obj_map(config_update)));
+    GgMap validated_config_update;
+
+    GG_TEST_ASSERT_OK(get_validated_component_config_update(
+        GG_STR("myComponent"),
+        component_to_configuration,
+        &validated_config_update
+    ));
+    TEST_ASSERT_EQUAL_INT(1, (int) validated_config_update.len);
 }
 
 #endif
